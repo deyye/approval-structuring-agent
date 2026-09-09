@@ -1,0 +1,5 @@
+PyMuPDF==1.28.2
+Pillow==12.3.0
+numpy==2.5.3
+openpyxl==3.1.5
+et-xmlfile==2.0.0

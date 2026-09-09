@@ -8,5 +8,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements.lock
       - run: python -m unittest discover -s tests -v
+      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim
+      - run: python scripts/check_ocr.py
+      - run: python scripts/demo.py --data /tmp/approval-demo
+      - run: python scripts/evaluate.py --samples /tmp/approval-demo/demo-source --out /tmp/approval-evaluation

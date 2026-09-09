@@ -7,13 +7,14 @@ from urllib.parse import urlparse,unquote
 import fitz
 from .extract import extract,FIELDS,STAGES,numeric
 from .compare import rows_for,export_xlsx
+from .review import update as apply_review
 
 ROOT=Path(__file__).resolve().parent.parent
 
 def load_env():
     p=ROOT/'.env'
     if p.exists():
-        for line in p.read_text().splitlines():
+        for line in p.read_text(encoding='utf-8').splitlines():
             line=line.strip()
             if line and not line.startswith('#') and '=' in line:
                 k,v=line.split('=',1)
@@ -25,38 +26,47 @@ class Store:
         self.lock=threading.RLock();self.jobs={};self.executor=ThreadPoolExecutor(max_workers=1)
     def list(self):
         with self.lock:
-            return [json.loads(p.read_text()) for p in sorted(self.path.glob('*.json'))]
+            return [json.loads(p.read_text(encoding='utf-8')) for p in sorted(self.path.glob('*.json'))]
     def get(self,i):
         if not re.fullmatch(r'[0-9a-f]{32}',i):raise ValueError('文件编号无效')
-        with self.lock:return json.loads((self.path/(i+'.json')).read_text())
+        with self.lock:return json.loads((self.path/(i+'.json')).read_text(encoding='utf-8'))
     def save(self,d):
         with self.lock:
             p=self.path/(d['id']+'.json');temp=p.with_suffix('.tmp')
             temp.write_text(json.dumps(d,ensure_ascii=False),encoding='utf-8');temp.replace(p)
+    def reprocess(self,jid,docid,llm):
+        job=self.jobs[jid]
+        try:
+            original=self.get(docid)
+            fresh=extract(self.path/(docid+'.pdf'),original['filename'],docid,llm)
+            with self.lock:
+                current=self.get(docid)
+                for k,old in current['fields'].items():
+                    if old.get('method')=='human':fresh['fields'][k]=old
+                for old in current['metrics']:
+                    if old.get('method')=='human':fresh['metrics']=[m for m in fresh['metrics'] if m['name']!=old['name']]+[old]
+                if any(h['kind']=='stage' for h in current.get('history',[])):fresh['stage']=current['stage']
+                fresh.update(history=current.get('history',[]),revision=current.get('revision',0)+1,sha256=current.get('sha256'),created_at=current.get('created_at'))
+                fresh['project_key']=fresh['fields']['项目代码']['value'] or 'unassigned:'+docid
+                fresh['project_name']=fresh['fields']['项目名称']['value'] or fresh['filename']
+                self.save(fresh)
+            job['results'].append({'id':docid,'filename':fresh['filename']})
+        except Exception as exc:job['errors'].append({'filename':docid,'message':'重新提取失败：'+type(exc).__name__})
+        finally:job.update(done=1,status='completed')
+
     def run(self,jid,items,llm):
         job=self.jobs[jid]
         for name,blob in items:
             try:
                 digest=hashlib.sha256(blob).hexdigest()
                 existing=next((d for d in self.list() if d.get('sha256')==digest),None)
-                if existing and llm and existing.get('engine')!='local+llm':
-                    fresh=extract(self.path/(existing['id']+'.pdf'),existing['filename'],existing['id'],True)
-                    fresh.update(sha256=digest,created_at=existing.get('created_at',time.time()),history=existing.get('history',[]))
-                    for field,old in existing['fields'].items():
-                        if old.get('method')=='human':fresh['fields'][field]=old
-                    for old in existing['metrics']:
-                        if old.get('method')=='human':
-                            fresh['metrics']=[m for m in fresh['metrics'] if m['name']!=old['name']]+[old]
-                    fresh['project_key']=fresh['fields']['项目代码']['value'] or 'unassigned:'+fresh['id']
-                    fresh['project_name']=fresh['fields']['项目名称']['value'] or fresh['filename']
-                    self.save(fresh)
                 if existing:
                     job['results'].append({'id':existing['id'],'filename':name,'duplicate':True});continue
                 i=uuid.uuid4().hex;p=self.path/(i+'.pdf');p.write_bytes(blob)
                 try:d=extract(p,name,i,llm)
                 except Exception:
                     p.unlink(missing_ok=True);raise
-                d.update(sha256=digest,created_at=time.time(),history=[])
+                d.update(sha256=digest,created_at=time.time(),history=[],revision=0)
                 self.save(d);job['results'].append({'id':i,'filename':name})
             except Exception as e:
                 job['errors'].append({'filename':name,'message':str(e) if isinstance(e,ValueError) else '解析失败：'+type(e).__name__})
@@ -81,6 +91,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:self.send({'error':'服务处理失败'},500)
     def get(self):
         s=self.server.store;p=urlparse(self.path).path
+        if p=='/api/health':return self.send({'status':'ok','version':'2.0'})
+        if p=='/api/jobs':return self.send(list(s.jobs.values()))
         if p=='/api/config':return self.send({'llm_ready':bool(os.getenv('LLM_MODEL') and os.getenv('LLM_BASE_URL')),'model':os.getenv('LLM_MODEL',''),'fields':FIELDS,'stages':STAGES})
         if p=='/api/documents':
             ds=s.list();groups={}
@@ -92,6 +104,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(s.jobs[jid])
         if p=='/api/export.xlsx':return self.send(export_xlsx(s.list()),ctype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',download='approval-comparison.xlsx')
         if p=='/api/export.json':return self.send(json.dumps(s.list(),ensure_ascii=False,indent=2),ctype='application/json',download='approval-evidence.json')
+        detail=re.fullmatch(r'/api/documents/([0-9a-f]{32})',p)
+        if detail:return self.send(s.get(detail.group(1)))
         m=re.fullmatch(r'/api/documents/([0-9a-f]{32})/pages/(\d+)\.png',p)
         if m:
             i,n=m.groups();d=s.get(i);n=int(n)
@@ -138,18 +152,18 @@ class Handler(BaseHTTPRequestHandler):
         m=re.fullmatch(r'/api/documents/([0-9a-f]{32})/review',p)
         if m:
             with s.lock:
-                d=s.get(m.group(1));kind=data['kind'];name=data['name'];value=data['value']
-                if not isinstance(value,str) or len(value)>15000:raise ValueError('字段内容无效')
-                if kind=='fixed':c=d['fields'][name]
-                elif kind=='metric':c=d['metrics'][int(data['index'])]
-                else:raise ValueError('字段类型无效')
-                d.setdefault('history',[]).append({'time':time.time(),'kind':kind,'name':name,'before':dict(c),'after':value})
-                c.update(value=value or None,status='reviewed' if value else 'missing',method='human')
-                if kind=='metric':c['normalized']=numeric(value)
-                if kind=='fixed' and name=='项目代码':d['project_key']=value or 'unassigned:'+d['id']
-                if kind=='fixed' and name=='项目名称':d['project_name']=value or d['filename']
+                d=apply_review(s.get(m.group(1)),data)
                 s.save(d)
-            return self.send({'ok':True})
+            return self.send({'ok':True,'revision':d['revision']})
+        m=re.fullmatch(r'/api/documents/([0-9a-f]{32})/reprocess',p)
+        if m:
+            i=m.group(1);s.get(i)
+            llm=bool(data.get('use_llm'))
+            if llm and not (os.getenv('LLM_MODEL') and os.getenv('LLM_BASE_URL')):raise ValueError('请先配置大模型')
+            if any(j['status']=='running' for j in s.jobs.values()):raise ValueError('请等待当前任务结束后重试')
+            jid=uuid.uuid4().hex;s.jobs[jid]={'id':jid,'status':'running','total':1,'done':0,'results':[],'errors':[]}
+            s.executor.submit(s.reprocess,jid,i,llm)
+            return self.send({'job_id':jid},202)
         self.send({'error':'未找到'},404)
 
 def main():

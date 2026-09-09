@@ -9,8 +9,7 @@ from PIL import Image, ImageFilter
 
 FIELDS = ['发文机关标志','发文字号','标题','印章','印发机关','印发日期','项目名称','项目代码','项目单位','建设内容','建设地点','总投资/匡算/估算/概算','资金来源','建设周期']
 STAGES = ['建议书/立项','可行性研究','初步设计','待确认']
-NUM = r'\d+(?:\.\d+)?'
-UNIT = r'万平方米|万立方米|平方米|平方千米|公顷|千米/小时|公里/小时|千米|公里|立方米|万元|亿元|个月|米|亩|万千瓦|千瓦时|兆瓦时|千瓦|兆瓦|吨/年|万吨/年|万吨|吨|个|处|盏|层|栋|车道'
+from .quantities import NUM, UNIT, VALUE, numeric
 
 def clean(s): return re.sub(r'\s+', '', s or '')
 def empty(): return {'value':None, 'status':'missing', 'evidence':[], 'method':'rule'}
@@ -45,14 +44,17 @@ def parse_pdf(path):
                     if abs(line.get('dir',(1,0))[1])>.15: continue  # diagonal platform watermark
                     spans=line.get('spans',[])
                     txt=clean(''.join(s['text'] for s in spans))
-                    if not txt or re.fullmatch(r'[—\-]*\d*[—\-]*',txt): continue
+                    if not txt:continue
+                    if re.fullmatch(r'[—\-]*\d*[—\-]*',txt) and (not re.search(r'\d',txt) or line['bbox'][1]<p.rect.height*.08 or (line['bbox'][1]>p.rect.height*.8 and int(txt.strip('—-'))==pi+1)):continue
                     if txt in ['投资项目在线审批监管系统','浙江政务服务网']: continue
                     bbox=list(line['bbox'])
                     pl.append({'text':txt,'page':pi+1,'bbox':bbox,'method':method})
             pl.sort(key=lambda x:(round(x['bbox'][1]/3),x['bbox'][0]))
             for li,l in enumerate(pl):
                 l['id']=f'p{pi+1}-l{li+1}';lines.append(l)
-            page['text_method']=method; pages.append(page)
+            page['text_method']=method
+            page['text_state']='readable' if sum(len(l['text']) for l in pl)>=20 else 'unreadable'
+            pages.append(page)
     # Character offsets preserve cross-line and cross-page evidence.
     text=''; offsets=[]
     for l in lines:
@@ -97,15 +99,6 @@ def stamps(path,pages):
     if candidates:return cell('有',candidates,'visual-heuristic','needs_review')
     return cell('无法判断',[],'visual-heuristic','needs_review')
 
-def numeric(raw):
-    raw=re.sub(r'('+NUM+r')('+UNIT+r')([-—~～至])',r'\1\3',clean(raw))
-    m=re.search(r'(约|不超过|不少于|以上|以下)?('+NUM+r')(?:\s*[-—~～至]\s*('+NUM+r'))?('+UNIT+r')',clean(raw))
-    if not m:return None
-    q,v,hi,u=m.groups(); factor={'公顷':10000,'万平方米':10000,'万立方米':10000,'公里':1000,'千米':1000,'亿元':10000}.get(u,1)
-    nu={'公顷':'平方米','万平方米':'平方米','万立方米':'立方米','公里':'米','千米':'米','亿元':'万元','公里/小时':'千米/小时'}.get(u,u)
-    n=Decimal(v)*factor; high=Decimal(hi)*factor if hi else None
-    return {'number':str(n),'upper':str(high) if high is not None else None,'unit':nu,'qualifier':q or '', 'raw_unit':u}
-
 METRICS=[
  ('总建筑面积',r'(?<!地上)(?<!地下)总建筑面积'),('地上建筑面积',r'地上(?:总)?建筑面积'),
  ('地下建筑面积',r'地下(?:总)?建筑面积|地下一层(?=\d)'),('总用地面积',r'总用地面积'),
@@ -116,7 +109,7 @@ METRICS=[
  ('人行道总面积',r'人行道总面积'),('绿化面积',r'绿化面积'),('路灯数量',r'路灯'),
  ('涵洞数量',r'涵洞'),('平交口数量',r'平交口'),('非机动车停车位',r'非机动车停车位'),
  ('雨水管长度',r'雨水管\([^)]*\)长'),('污水管长度',r'污水管\([^)]*\)长'),('给水管长度',r'给水管\([^)]*\)长'),
- ('建筑高度',r'建筑高度'),('地上层数',r'地上'),('地下层数',r'地下'),
+ ('仿石陶瓷透水砖面积',r'仿石陶瓷透水砖面积'),('地下一层层高',r'地下一层[^。]*?层高'),('建筑高度',r'建筑高度'),('地上层数',r'地上'),('地下层数',r'地下'),
 ]
 
 def extract(path,name,doc_id,use_llm=False):
@@ -150,7 +143,9 @@ def extract(path,name,doc_id,use_llm=False):
     # Section headings may wrap: boundary from next numbered heading, not page.
     headings=[]
     for a,b,l in offsets:
-        if re.match(r'^[一二三四五六七八九十]+、',l['text']):headings.append((a,b,l['text']))
+        if re.match(r'^[一二三四五六七八九十]+、',l['text']):
+            hm=re.match(r'^([一二三四五六七八九十]+、[^：:。]{2,25})[：:。]',l['text'])
+            headings.append((a,a+hm.end() if hm else b,hm.group(1) if hm else l['text']))
     sec=[]
     for i,(a,b,h) in enumerate(headings):
         end=headings[i+1][0] if i+1<len(headings) else len(text)
@@ -185,25 +180,28 @@ def extract(path,name,doc_id,use_llm=False):
     seen=set()
     for label,pat in METRICS:
         for h,a,b,v in areas:
-            for m in re.finditer(r'(?:'+pat+r')(?:为)?(约?'+NUM+r'(?:(?:'+UNIT+r')?[-—~～至]'+NUM+r')?(?:'+UNIT+r'))',v):
+            for m in re.finditer(r'(?:'+pat+r')(?:为)?('+VALUE+r')',v):
                 key=(label,m.group(1))
                 if key in seen:continue
                 seen.add(key)
-                metrics.append({'name':label,**cell(m.group(1),evidence(offsets,a+m.start(),a+m.end())), 'normalized':numeric(m.group(1))})
+                metrics.append({'name':label,**cell(m.group(1),evidence(offsets,a+m.start(),a+m.end())), 'normalized':numeric(m.group(1)), 'scope':'construction' if ('建设内容' in h or '建设规模' in h) else 'design'})
     # Unknown numeric attributes: preserve their original labels, with evidence.
     # Restrict to construction sections and explicit measurement nouns.
-    covered={e['id']+':'+m['value'] for m in metrics for e in m['evidence']}
+    covered=[(e['id'],m['value']) for m in metrics for e in m['evidence']]
     for h,a,b,v in areas:
         pattern=r'([\u4e00-\u9fffA-Za-z]{2,25}(?:面积|高度|宽度|长度|容量|功率|数量|层高))(?:为)?(约?'+NUM+r'(?:'+UNIT+r'))'
         for m in re.finditer(pattern,v):
             ev=evidence(offsets,a+m.start(),a+m.end())
-            if any(e['id']+':'+m.group(2) in covered for e in ev):continue
+            if any(e['id']==lineid and m.group(2) in value for e in ev for lineid,value in covered):continue
             label=re.sub(r'^(?:项目|其中|主要|设置|新建|总计)', '', m.group(1))
             if (label,m.group(2)) not in seen:
                 seen.add((label,m.group(2)))
-                metrics.append({'name':label,**cell(m.group(2),ev), 'normalized':numeric(m.group(2))})
+                metrics.append({'name':label,**cell(m.group(2),ev), 'normalized':numeric(m.group(2)), 'scope':'construction' if ('建设内容' in h or '建设规模' in h) else 'design'})
     if not fs['建设内容']['value']:warnings.append('未找到明确的建设内容章节，建议启用大模型补充或人工核对。')
-    result={'id':doc_id,'filename':name,'stage':stage,'fields':fs,'metrics':metrics,'pages':pages,'lines':lines,'warnings':warnings,'engine':'local','schema_version':1}
+    result={'id':doc_id,'filename':name,'stage':stage,'fields':fs,'metrics':metrics,'pages':pages,'lines':lines,'warnings':warnings,'engine':'local','schema_version':2}
+    if any(p['text_state']=='unreadable' for p in pages):
+        for c in fs.values():
+            if c['value'] is None:c['status']='uncertain'
     if use_llm:
         try:
             candidate=copy.deepcopy(result)
@@ -223,6 +221,7 @@ def extract(path,name,doc_id,use_llm=False):
     fs=result['fields']
     result['project_key']=fs['项目代码']['value'] or ('unassigned:'+doc_id)
     result['project_name']=fs['项目名称']['value'] or name
+    result['quality']={'evidence_fields':sum(bool(c['evidence']) for c in fs.values()),'review_fields':sum(c['status'] in ['needs_review','conflict','uncertain'] for c in fs.values())}
     return result
 
 def chat(messages,model):
