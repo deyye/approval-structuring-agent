@@ -177,10 +177,19 @@ $('editForm').onsubmit=async e=>{
     selectCell(doc,row,row.cells[g.documents.indexOf(doc)]);toast('修订与证据已保存，差异已重新计算。');
   } catch(err) {toast(err.message);}
 };
+async function testModelConnection(vision) {
+  const b=$(vision?'testVision':'testModel');b.disabled=true;
+  $('modelTestResult').textContent='正在测试连接（仅发送测试内容）…';
+  try {const r=await api('/api/model/test',{vision});$('modelTestResult').textContent=r.model+' · 连接正常 · '+r.latency_ms+' ms';}
+  catch(e){$('modelTestResult').textContent=e.message;}finally{b.disabled=false;}
+}
+$('testModel').onclick=()=>testModelConnection(false);$('testVision').onclick=()=>testModelConnection(true);
 (async()=>{
   try {
     const config=await api('/api/config');state.stages=config.stages;$('stageSelect').replaceChildren(...config.stages.map(s=>option(s,s)));
     $('useModel').disabled=!config.llm_ready;
+    $('testModel').disabled=!config.llm_ready;$('testVision').disabled=!config.llm_ready||!config.vision_model;
+    if(config.model_error)$('modelHelp').textContent=config.model_error;
     if(config.llm_ready){$('engineBadge').textContent='大模型辅助已配置';$('modelHelp').textContent='勾选后会将批文发送至已配置的模型服务。';}
     await refresh();const jid=sessionStorage.getItem('activeJob');if(jid){await watchJob(jid);sessionStorage.removeItem('activeJob');}
   }catch(e){toast(e.message);}

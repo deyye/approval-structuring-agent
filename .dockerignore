@@ -1,6 +1,8 @@
-.env
-.git
-.venv
-data
-__pycache__
-*.zip
+**
+!requirements.lock
+!app
+!app/**
+!scripts
+!scripts/check_model.py
+app/**/__pycache__
+app/**/*.pyc

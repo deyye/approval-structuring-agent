@@ -15,3 +15,5 @@ select:focus-visible{outline:3px solid #5a9dd0;outline-offset:2px}
 .tag{border:1px solid #173a6010;padding:4px 9px;border-radius:5px}
 #editButton{padding:7px 10px;border:1px solid #c6d8e8;border-radius:5px;background:#f3f8fc}
 @media(max-width:680px){.toolbar{flex-wrap:wrap}.toolbar>label{padding:8px 0}.document-tools label{min-width:0;width:100%}#documentSelect{min-width:0;flex:1}header .top-actions{gap:8px}.brand strong{letter-spacing:2px}}
+
+.model-tests{display:flex;flex-wrap:wrap;gap:6px}.model-tests button{font-size:12px;padding:7px 9px}#modelTestResult{overflow-wrap:anywhere;margin:8px 0}

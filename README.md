@@ -54,7 +54,8 @@ python scripts/demo.py --samples /path/to/pdfs --serve
 - 修改配置后重启，在界面勾选“使用大模型辅助抽取”。勾选后才将批文发送至配置的模型服务，密钥留在后端。
 - `VISION_MODEL`用于确认印章候选，可不填。
 - 已上传文件在单文档视图点击“重新提取”，会保留人工修订；重复上传默认去重。
-- 真实模型服务尚需用自己的凭据完成联调；本项目测试覆盖证据校验、协议代码和失败降级，不冒充真实模型质量测评。
+- 运行 `python scripts/check_model.py` 或点击界面“测试文字模型”检查真实连接；视觉模型可用 `--vision` 检查。实际凭据仅在本机配置。
+- 支持可配置超时、限流重试、JSON模式和密钥文件；详见部署文档。
 
 ## 中文扫描与印章
 
@@ -96,11 +97,11 @@ python -m unittest discover -s tests -v
 ## 部署
 
 ```bash
-docker build -t approval-structuring-agent .
-docker run --rm -p 127.0.0.1:8765:8765 -v approval-data:/app/data approval-structuring-agent
+cp .env.example .env
+docker compose up -d --build --wait
 ```
 
-使用模型时添加`--env-file .env`。Dockerfile含中文OCR；镜像构建需在有Docker的环境验收。本版本为本机单用户工具，无公网账号权限体系，不应直接暴露公网。
+包含中文 OCR、非 root 运行、健康检查和数据持久化。模型配置与诊断、密钥挂载、服务器访问、备份、故障处理详见 [外部模型与 Docker 部署](docs/MODEL_DOCKER.md)。
 
 Python标准库HTTP服务 + PyMuPDF + NumPy/Pillow + openpyxl；原生JavaScript前端，无需Node构建。可选`npm run dev`用于统一开发入口，仍启动Python服务。
 

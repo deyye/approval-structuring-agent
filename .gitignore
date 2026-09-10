@@ -7,3 +7,5 @@ data/
 
 .qa/
 evaluation/results/
+secrets/
+backups/

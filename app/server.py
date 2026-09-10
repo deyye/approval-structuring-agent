@@ -8,6 +8,7 @@ import fitz
 from .extract import extract,FIELDS,STAGES,numeric
 from .compare import rows_for,export_xlsx
 from .review import update as apply_review
+from .model_client import public_config, probe, ModelError
 
 ROOT=Path(__file__).resolve().parent.parent
 
@@ -23,7 +24,7 @@ def load_env():
 class Store:
     def __init__(self,path):
         self.path=Path(path);self.path.mkdir(parents=True,exist_ok=True)
-        self.lock=threading.RLock();self.jobs={};self.executor=ThreadPoolExecutor(max_workers=1)
+        self.lock=threading.RLock();self.model_probe_lock=threading.Lock();self.jobs={};self.executor=ThreadPoolExecutor(max_workers=1)
     def list(self):
         with self.lock:
             return [json.loads(p.read_text(encoding='utf-8')) for p in sorted(self.path.glob('*.json'))]
@@ -93,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
         s=self.server.store;p=urlparse(self.path).path
         if p=='/api/health':return self.send({'status':'ok','version':'2.0'})
         if p=='/api/jobs':return self.send(list(s.jobs.values()))
-        if p=='/api/config':return self.send({'llm_ready':bool(os.getenv('LLM_MODEL') and os.getenv('LLM_BASE_URL')),'model':os.getenv('LLM_MODEL',''),'fields':FIELDS,'stages':STAGES})
+        if p=='/api/config':return self.send({**public_config(),'fields':FIELDS,'stages':STAGES})
         if p=='/api/documents':
             ds=s.list();groups={}
             for d in ds:groups.setdefault(d['project_key'],[]).append(d)
@@ -132,6 +133,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:self.send({'error':'处理失败，请重试'},500)
     def post(self,p,data):
         s=self.server.store
+        if p=='/api/model/test':
+            if not self.server.store.model_probe_lock.acquire(blocking=False):
+                return self.send({'error':'正在测试模型连接，请稍后重试'},429)
+            try:return self.send(probe(vision=data.get('vision') is True))
+            except ModelError as exc:return self.send({'error':str(exc)},502)
+            finally:self.server.store.model_probe_lock.release()
         if p=='/api/upload':
             fs=data.get('files',[])
             if not 1<=len(fs)<=10:raise ValueError('一次上传1至10份PDF')
@@ -144,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
                 items.append((name,blob))
             if sum(j['status']=='running' for j in s.jobs.values())>=3:return self.send({'error':'任务繁忙，请稍后再试'},429)
             llm=bool(data.get('use_llm'))
-            if llm and not (os.getenv('LLM_MODEL') and os.getenv('LLM_BASE_URL')):raise ValueError('请先在.env配置大模型')
+            if llm and not public_config()['llm_ready']:raise ValueError('请先在.env配置大模型')
             jid=uuid.uuid4().hex
             s.jobs[jid]={'id':jid,'status':'running','total':len(items),'done':0,'results':[],'errors':[]}
             s.executor.submit(s.run,jid,items,llm)
@@ -159,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             i=m.group(1);s.get(i)
             llm=bool(data.get('use_llm'))
-            if llm and not (os.getenv('LLM_MODEL') and os.getenv('LLM_BASE_URL')):raise ValueError('请先配置大模型')
+            if llm and not public_config()['llm_ready']:raise ValueError('请先配置大模型')
             if any(j['status']=='running' for j in s.jobs.values()):raise ValueError('请等待当前任务结束后重试')
             jid=uuid.uuid4().hex;s.jobs[jid]={'id':jid,'status':'running','total':1,'done':0,'results':[],'errors':[]}
             s.executor.submit(s.reprocess,jid,i,llm)
