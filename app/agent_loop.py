@@ -356,10 +356,17 @@ def audit(path, name, doc_id, planner=None):
 def _main():
     import glob
     import sys
-    root = sys.argv[1] if len(sys.argv) > 1 else '/Users/scy/WorkBuddy/2026-09-10-12-25-18/outputs/regression-corpus/ruian'
-    rows = []
-    for i, p in enumerate(sorted(glob.glob(os.path.join(root, '*.pdf'))), 1):
-        rows.append(audit(p, os.path.basename(p), 'a%03d' % i))
+    # 语料目录优先级：命令行参数 > SAMPLE_DIR 环境变量 > 仓库内 samples/。
+    # 不要写死本机绝对路径——换台机器就跑不起来，也会把本地目录结构带进版本库。
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = (sys.argv[1] if len(sys.argv) > 1
+            else os.getenv('SAMPLE_DIR') or os.path.join(here, 'samples'))
+    files = sorted(glob.glob(os.path.join(root, '*.pdf')))
+    if not files:
+        print('未在 %s 找到 PDF。' % root)
+        print('用法：python -m app.agent_loop [语料目录]，或用 SAMPLE_DIR 环境变量指定。')
+        return
+    rows = [audit(p, os.path.basename(p), 'a%03d' % i) for i, p in enumerate(files, 1)]
     silent = [r for r in rows if r['baseline']['silent_issues']]
     escalated = [r for r in rows if r['agent']['status'] == 'escalated']
     repaired = [r for r in rows if r['agent']['metrics'] > r['baseline']['metrics']]
