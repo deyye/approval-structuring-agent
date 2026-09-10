@@ -3,6 +3,22 @@ const $ = id => document.getElementById(id);
 const state = {groups: [], key: null, kind: 'fixed', docId: '', selection: null, page: 1, stages: [], evidenceIds: new Set()};
 const labels = {same:'一致',different:'内容变化',equivalent:'表述差异',missing:'未载明',review:'待核对'};
 let toastTimer;
+// 说明每个值的来源与可信度，让复核者知道"为什么要确认"，而不是只看到一个红色状态。
+const methodNotes = {
+  human: c => c.evidence_binding === 'reviewed' ? '此值及证据经人工复核。' : '此值经人工修订，以下仍为原提取证据。',
+  'macos-vision': () => '本值由版头图片经 OCR 识别得到，可能存在识别误差，请对照原文版头核对。',
+  tesseract: () => '本值由版头图片经 OCR 识别得到，可能存在识别误差，请对照原文版头核对。',
+  'vision-required': () => '该要素位于图片层且未能识别出内容，请人工查看原文版头后再填。',
+  filename: () => '正文无该文本，值取自附件名推断，请核对。',
+  'title-inference': () => '该值由标题推断而来，请核对事项口径。',
+  addressee: () => '该值由主送机关（收件人）推断为项目单位，请核对角色。',
+  'visual-heuristic': () => '红色近圆形区域检测结果，请核对图像后确认；不鉴定真实性。'
+};
+function methodNote(row, c) {
+  if (row.name === '印章' && !methodNotes[c.method]) return '';
+  const note = methodNotes[c.method];
+  return note ? note(c) : '';
+}
 function toast(msg) {
   $('toast').textContent = msg; $('toast').hidden = false;
   clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 10000);
@@ -88,7 +104,7 @@ function selectCell(doc,row,c,index=null) {
   $('evidenceEmpty').hidden=true;$('evidenceContent').hidden=false;
   $('selectedField').textContent=row.name+' / '+doc.stage;$('selectedValue').textContent=c.value??(c.status==='uncertain'?'识别不确定':'原文未载明');
   $('evidenceStatus').textContent=['needs_review','conflict','uncertain'].includes(c.status)?'需要人工确认':c.status==='reviewed'?'人工已复核':'原文证据';
-  $('humanNote').textContent=c.method==='human'?(c.evidence_binding==='reviewed'?'此值及证据经人工复核。':'此值经人工修订，以下仍为原提取证据。'):row.name==='印章'&&c.method==='visual-heuristic'?'红色近圆形区域检测结果，请核对图像后确认；不鉴定真实性。':'';
+  $('humanNote').textContent=methodNote(row,c);
   $('variants').replaceChildren();$('editButton').disabled=false;
   if (row.kind==='metric') {
     const matches=doc.metrics.map((m,i)=>({m,i})).filter(({m})=>m.name===row.name);

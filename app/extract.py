@@ -1,7 +1,8 @@
 """Evidence-first extraction: local rules, optional grounded LLM, no sample answers."""
 from __future__ import annotations
 from .model_client import chat, ModelError
-import base64, copy, io, json, os, re, urllib.request
+from . import vision_ocr
+import base64, copy, io, json, os, re, shutil, tempfile, urllib.request
 from decimal import Decimal
 from pathlib import Path
 import fitz
@@ -10,6 +11,17 @@ from PIL import Image, ImageFilter
 
 FIELDS = ['发文机关标志','发文字号','标题','印章','印发机关','印发日期','项目名称','项目代码','项目单位','建设内容','建设地点','总投资/匡算/估算/概算','资金来源','建设周期']
 STAGES = ['建议书/立项','可行性研究','初步设计','待确认']
+# 项目单位后缀：基层政府投资项目大量以"街道办事处/管委会/人民政府"为业主，
+# 另有一批以学校、法院等事业单位为业主，后缀表不全都会漏抽
+# （实测公开批复上"街道办事处"漏抽率 43%，"中学/法院"再漏 6%）。
+ORG = r'(?:公司|集团|局|委员会|办公室|街道办事处|管委会|管理委员会|人民政府|中心|医院|学校|学院|大学|研究院|银行|合作社|农场|林场|中学|小学|幼儿园|法院|检察院)'
+# 发文字号行：定位版头带与主送机关的锚点。
+DOC_NUMBER_RE = r'[\u4e00-\u9fff]{2,15}[〔\[]\d{4}[〕\]]\d+号'
+# 版头带里常见的水印/系统字样；OCR 时须过滤，否则会污染标题与红头提取。
+HEADER_NOISE = ['浙江政务服务网', '投资在线平台', '投资项目在线审批监管系统', '浙江省投资项目在线审批监管平台',
+                '工程审批系统']
+# 整页墨迹占比低于该值视为空白页（仅版式水印，无正文），不报"需复核"。
+INK_BLANK_RATIO = 0.004
 from .quantities import NUM, UNIT, VALUE, numeric
 
 def clean(s): return re.sub(r'\s+', '', s or '')
@@ -29,6 +41,7 @@ def parse_pdf(path):
             page = {'number':pi+1, 'width':p.rect.width, 'height':p.rect.height}
             raw = p.get_text('dict')
             method = 'native'
+            ocr_fallback, blank = [], False
             native_text = clean(p.get_text())
             if len(native_text)<30:
                 try:
@@ -38,9 +51,30 @@ def parse_pdf(path):
                     tp=p.get_textpage_ocr(language='chi_sim+eng', dpi=200, full=True)
                     raw=p.get_text('dict',textpage=tp); method='ocr'
                 except Exception:
-                    warnings.append(f'第{pi+1}页文本不足，中文OCR不可用；该页可能为空白页或扫描页，需复核。')
+                    # 整页 OCR 回退：用本机可用的后端（macOS Vision 优先）识别整页。
+                    # 识别到内容就补进来（无精确坐标，证据只能落到整页，方法标记出来）；
+                    # 页面几乎无墨迹＝真空白页，不必打扰人工；有墨迹却识别不出才报复核告警。
+                    ocr_fallback,ink=ocr_page_lines(p)
+                    # 空白判定必须优先于 OCR 输出：近乎无墨迹的页面，OCR 只会从水印上
+                    # "读"出乱码。实测 seq=27 第5页仅对角水印+页码，OCR 吐出一行
+                    # 「咨左线亚台"一程亩非五」，墨迹占比 0.00296 本应判空白，
+                    # 却因 OCR 先返回而被判成 ocr-vision——既产生误报告警，
+                    # 乱码还混进 lines 参与字段抽取。故先看墨迹，并丢弃噪声输出。
+                    if ink is not None and ink<INK_BLANK_RATIO:
+                        blank=True;ocr_fallback=[]
+                    elif ocr_fallback: method='ocr-vision'
+                    else: warnings.append(f'第{pi+1}页无文本层且未能识别出内容，该页可能为扫描页，需复核。')
             pl=[]
             for b in raw.get('blocks',[]):
+                # 部分公文 PDF 把红头/标题做成图片（不进文本层），标记出来，
+                # 供字段抽取区分「确实没有该要素」与「有但读不到、需视觉复核」。
+                if b.get('type')==1:
+                    bx=b.get('bbox',(0,0,0,0))
+                    if pi==0 and bx[1]<p.rect.height*.5:
+                        # 版头区存在图片：红头/标题可能是图片层，需 OCR 才能读。
+                        page['has_top_image']=True
+                        if (bx[2]-bx[0])>p.rect.width*.5: page['header_image']=True
+                    continue
                 for line in b.get('lines',[]):
                     if abs(line.get('dir',(1,0))[1])>.15: continue  # diagonal platform watermark
                     spans=line.get('spans',[])
@@ -50,11 +84,16 @@ def parse_pdf(path):
                     if txt in ['投资项目在线审批监管系统','浙江政务服务网']: continue
                     bbox=list(line['bbox'])
                     pl.append({'text':txt,'page':pi+1,'bbox':bbox,'method':method})
+            if ocr_fallback:
+                full=list(p.rect)
+                for txt in ocr_fallback:
+                    pl.append({'text':txt,'page':pi+1,'bbox':full,'method':method})
             pl.sort(key=lambda x:(round(x['bbox'][1]/3),x['bbox'][0]))
             for li,l in enumerate(pl):
                 l['id']=f'p{pi+1}-l{li+1}';lines.append(l)
             page['text_method']=method
-            page['text_state']='readable' if sum(len(l['text']) for l in pl)>=20 else 'unreadable'
+            if blank: page['text_state']='blank'
+            else: page['text_state']='readable' if sum(len(l['text']) for l in pl)>=20 else 'unreadable'
             pages.append(page)
     # Character offsets preserve cross-line and cross-page evidence.
     text=''; offsets=[]
@@ -69,6 +108,119 @@ def evidence(offsets,start,end):
 def found(text,offsets,pattern,group=1,flags=0):
     m=re.search(pattern,text,flags)
     return cell(m.group(group),evidence(offsets,*m.span(group))) if m else empty()
+
+def mark_conflicts(result):
+    """同一文档内同名指标出现多值时，不静默合并：全部标 conflict 并告警。
+
+    独立成函数是为了让 agent 循环（app/agent_loop.py）在 extract() 之后追加指标时
+    能对新增部分再跑一次；否则 agent 新加的冲突指标会漏标（实测 seq=6 出现两条
+    「总面积」22.85/5.40hm2 却都不带 conflict）。本函数幂等：重复调用不重复告警。
+    """
+    for label in {x['name'] for x in result['metrics']}:
+        hits=[x for x in result['metrics'] if x['name']==label]
+        if len({x['value'] for x in hits})>1:
+            for x in hits:x['status']='conflict'
+            message=f'指标“{label}”存在多个值，请核对统计范围。'
+            if message not in result['warnings']:result['warnings'].append(message)
+    return result
+
+def find_imprint(lines,pages):
+    """定位版记里的印发机关：必须在页面下方，不得以正文发文机关代替。"""
+    for l in lines:
+        if re.fullmatch(r'[\u4e00-\u9fff]{3,30}办公室',l['text']) and l['bbox'][1]>pages[l['page']-1]['height']*.55:
+            return l['text'],[{'id':l['id'],'page':l['page'],'bbox':l['bbox'],'quote':l['text']}]
+    for date_line in [l for l in lines if re.search(r'\d{4}年\d+月\d+日印发',l['text'])]:
+        for l in lines:
+            if l['page']==date_line['page'] and abs(l['bbox'][1]-date_line['bbox'][1])<12:
+                m=re.match(r'^([\u4e00-\u9fff]{3,35}(?:局|委员会|办公室))(?=\d{4}年|$)',l['text'])
+                if m:return m.group(1),[{'id':l['id'],'page':l['page'],'bbox':l['bbox'],'quote':m.group(1)}]
+    return None,[]
+
+def refine_header_mark(mark,imprint):
+    """用文本层的印发机关校验 OCR 红头，返回 (值, 告警或 None)。
+
+    红头常与印发机关同源（后者多为前者加"办公室"），故可用它做交叉校验：
+    若红头里含印发机关主体，则以主体起点截断——修掉 OCR 把版头水印并进机关名的情况；
+    若两者对不上，则不擅自改值，改为告警交人工核对。
+    """
+    if not imprint:return mark,None
+    core=re.sub(r'(?:办公室|秘书科|综合科|机要科)$','',imprint)
+    if len(core)<5 or mark==core+'文件':return mark,None
+    if core in mark:
+        trimmed=mark[mark.rindex(core):]
+        return trimmed,'发文机关标志由OCR取得，已按印发机关「%s」截去识别噪声，请核对。'%imprint
+    return mark,'发文机关标志（%s）与印发机关（%s）不一致，请核对。'%(mark,imprint)
+
+def header_band(pages,offsets):
+    """版头带 = 页顶 → 正文首行（主送机关）顶部。
+    红头、发文字号、标题都位于主送机关之上；无主送机关时退到发文字号下方 220pt。
+    用结构元素（发文字号/主送机关）定位，不用页高比例——公文版式差异极大
+    （实测同类公文正文可晚至页高 61% 处才起始）。"""
+    p1=[l for _,_,l in offsets if l['page']==1]
+    num_b=next((l['bbox'][3] for l in p1 if re.fullmatch(DOC_NUMBER_RE,l['text'].strip())),None)
+    adr_y=next((l['bbox'][1] for l in p1 if re.fullmatch(r'[\u4e00-\u9fff]{3,40}'+ORG+r'[：:]',l['text'].strip())),None)
+    bottom=adr_y if adr_y else ((num_b+220) if num_b else pages[0]['height']*.5)
+    return fitz.Rect(0,0,pages[0]['width'],min(bottom,pages[0]['height']))
+
+def ocr_header(path,pages,offsets):
+    """对版头带做一次定向 OCR（红头与标题常为图片层，不进文本层）。
+    返回 (过滤拼接后的文本, 方法名, 区域)；OCR 不可用或无内容时返回 (None,None,None)。
+    只处理版头带、不做整页 OCR：更快，也不受正文数字干扰。"""
+    if not pages[0].get('has_top_image') or not vision_ocr.available():
+        return None,None,None
+    band=header_band(pages,offsets)
+    tmpdir=None
+    try:
+        with fitz.open(path) as doc:
+            pix=doc[0].get_pixmap(matrix=fitz.Matrix(4,4),clip=band,alpha=False)
+            tmpdir=tempfile.mkdtemp(prefix='header-ocr-')
+            png=str(Path(tmpdir)/'header.png'); pix.save(png)
+        text,method=vision_ocr.recognize(png)
+    except Exception:
+        return None,None,None
+    finally:
+        if tmpdir: shutil.rmtree(tmpdir,ignore_errors=True)
+    if not text: return None,None,None
+    lines=[]
+    for raw in text.splitlines():
+        line=clean(raw)
+        # 水印与红头同处一行时，OCR 会把它们并成一行（实测"龙资在线平台瑞安市发展和改革局文件"）。
+        # 先剥掉行首的水印片段，再过噪声词表，避免水印被当成机关名的一部分。
+        line=re.sub(r'^.*?(?:在线平台|政务服务网|审批系统|在线审批)','',line)
+        if line and re.search(r'[\u4e00-\u9fff]',line) and not any(n in line for n in HEADER_NOISE):
+            lines.append(line)
+    return (''.join(lines) or None), method, band
+
+def ocr_page_lines(page):
+    """整页 OCR 回退：识别送到这一页，返回 (过滤后的文本行, 墨迹占比)。
+
+    仅在整页无文本层时调用（原生文本 <30 字符）。墨迹占比用于区分两种情况：
+    几乎无墨迹＝真空白页（不必打扰人工）；有墨迹但识别不出＝疑似扫描页（须报复核）。
+    OCR 后端不可用时返回 ([], None)。
+    """
+    if not vision_ocr.available(): return [],None
+    tmpdir=None
+    try:
+        pix=page.get_pixmap(matrix=fitz.Matrix(3,3),alpha=False)
+        arr=np.frombuffer(pix.samples,dtype='uint8').reshape(pix.height,pix.width,pix.n)[:,:,:3]
+        ink=float((arr.mean(axis=2)<200).mean())
+        tmpdir=tempfile.mkdtemp(prefix='page-ocr-')
+        png=str(Path(tmpdir)/'page.png'); pix.save(png)
+        text,_=vision_ocr.recognize(png)
+    except Exception:
+        return [],None
+    finally:
+        if tmpdir: shutil.rmtree(tmpdir,ignore_errors=True)
+    if not text: return [],ink
+    out=[]
+    for raw in text.splitlines():
+        line=clean(raw)
+        line=re.sub(r'^.*?(?:在线平台|政务服务网|审批系统|在线审批)','',line)
+        if not line or not re.search(r'[\u4e00-\u9fff]',line): continue
+        if any(n in line for n in HEADER_NOISE): continue
+        if re.fullmatch(r'[—\-]*\d*[—\-]*',line): continue  # 页码/分隔符
+        out.append(line)
+    return out,ink
 
 def stamps(path,pages):
     """Red, roughly round connected clusters. Heuristic result is always reviewable."""
@@ -116,31 +268,61 @@ METRICS=[
 def extract(path,name,doc_id,use_llm=False):
     pages,lines,text,offsets,warnings=parse_pdf(path)
     fs={k:empty() for k in FIELDS}
-    fs['发文机关标志']=found(text,offsets,r'([\u4e00-\u9fff]{2,25}(?:局|委员会)文件)')
     for a,b,l in offsets:
-        if l['page']==1 and re.fullmatch(r'[\u4e00-\u9fff]{2,15}[〔\[]\d{4}[〕\]]\d+号',l['text']):
+        if l['page']==1 and re.fullmatch(DOC_NUMBER_RE,l['text']):
             fs['发文字号']=cell(l['text'],evidence(offsets,a,b));break
+    # 版头区为图片时先做一次定向 OCR：红头与标题同在这一带，一次裁剪同时服务两个字段。
+    ocr_text,ocr_method,ocr_band=ocr_header(path,pages,offsets)
+    ocr_ev=[{'id':'p1-header','page':1,'bbox':list(ocr_band),'quote':ocr_text}] if (ocr_band and ocr_text) else []
+    # 标题证据等级：原文直取（无损）> 附件名（发布系统生成的无损文本）> 版头 OCR（有识别误差）。
+    # 两者都在时做交叉校验：实测 OCR 会把「项目建议书」认成「项日建议书」、「研」认成「砑」，
+    # 直接采信 OCR 会连带打坏项目名称与阶段判定，故不一致时采信附件名并把分歧记为告警。
     fs['标题']=found(text,offsets,r'(关于.{3,100}?的批复)')
+    file_title=re.search(r'(关于.{3,120}?的批复)',clean(name or ''))
+    ocr_title=re.search(r'(关于.{3,120}?的批复)',ocr_text) if ocr_text else None
+    if file_title and ocr_title and file_title.group(1)!=ocr_title.group(1):
+        warnings.append('附件名标题与版头OCR标题不一致（OCR存在识别误差可能）：附件名「%s」／OCR「%s」，已采用附件名，请核对。'
+                        %(file_title.group(1),ocr_title.group(1)))
+    if not fs['标题']['value']:
+        if file_title:
+            fs['标题']=cell(file_title.group(1),[],'filename','needs_review')
+        elif ocr_title:
+            # 附件名不含标题时（如"初步设计批复文件.pdf"这类通用名），OCR 是唯一来源。
+            fs['标题']=cell(ocr_title.group(1),ocr_ev,ocr_method,'needs_review')
     fs['项目代码']=found(text,offsets,r'(\d{4}-\d{6}-\d{2}-\d{2}-\d{6})')
     fs['印发日期']=found(text,offsets,r'(\d{4}年\d{1,2}月\d{1,2}日)印发')
-    # Imprint office must occur in bottom matter; no inference from signature.
-    for l in lines:
-        if re.fullmatch(r'[\u4e00-\u9fff]{3,30}办公室',l['text']) and l['bbox'][1]>pages[l['page']-1]['height']*.55:
-            fs['印发机关']=cell(l['text'],[{'id':l['id'],'page':l['page'],'bbox':l['bbox'],'quote':l['text']}])
-    if not fs['印发机关']['value']:
-        for date_line in [l for l in lines if re.search(r'\d{4}年\d+月\d+日印发',l['text'])]:
-            for l in lines:
-                if l['page']==date_line['page'] and abs(l['bbox'][1]-date_line['bbox'][1])<12:
-                    m=re.match(r'^([\u4e00-\u9fff]{3,35}(?:局|委员会|办公室))(?=\d{4}年|$)',l['text'])
-                    if m:fs['印发机关']=cell(m.group(1),[{'id':l['id'],'page':l['page'],'bbox':l['bbox'],'quote':m.group(1)}])
+    imprint,imprint_ev=find_imprint(lines,pages)
+    if imprint:fs['印发机关']=cell(imprint,imprint_ev)
+    # 发文机关标志放在印发机关之后：OCR 结果需要拿文本层的印发机关做校验。
+    fs['发文机关标志']=found(text,offsets,r'([\u4e00-\u9fff]{2,25}(?:局|委员会|政府|办公室)文件)')
+    if not fs['发文机关标志']['value'] and ocr_text:
+        m=re.search(r'([\u4e00-\u9fff]{2,25}(?:局|委员会|政府|办公室)文件)',ocr_text)
+        if m:
+            mark,note=refine_header_mark(m.group(1),imprint)
+            fs['发文机关标志']=cell(mark,ocr_ev,ocr_method,'needs_review')
+            if note:warnings.append(note)
+    if not fs['发文机关标志']['value'] and pages[0].get('header_image'):
+        # 红头区是图片而非文本：不能静默留空（会被误读成"该文件没有红头"），
+        # 标为需复核并给告警，指向 OCR/视觉通路。
+        fs['发文机关标志']=cell(None,[],'vision-required','needs_review')
+        warnings.append('发文机关标志未从文本层取到，首页版头为图片层，需 OCR/视觉模型复核。')
     title=fs['标题']['value'] or ''
     stage='初步设计' if '初步设计' in title else '可行性研究' if '可行性研究' in title else '建议书/立项' if ('建议书' in title or '立项' in title) else '待确认'
     if '立项' in title:warnings.append('标题为立项申请批复，本次归入建议书/立项阶段，请核对事项口径。')
     if title:
-        pm=re.search(r'关于(.+?)(?:项目建议书|可行性研究报告|初步设计|立项申请)的批复',title)
+        # 事项边界词：除三阶段外，企业投资项目「核准」「项目申请报告」也写在标题里，
+        # 否则这类批复推不出项目名称。
+        pm=re.search(r'关于(.+?)(?:项目建议书|可行性研究报告|初步设计|立项申请|项目申请报告|核准)的批复',title)
         if pm:
-            project=pm.group(1); start=text.find(title)+pm.start(1)
-            fs['项目名称']=cell(project,evidence(offsets,start,start+len(project)))
+            project=pm.group(1); pos=text.find(title)
+            # 项目名称由标题推断而来，属结构推断而非字段自述，与项目单位保持同一口径标 needs_review。
+            if pos>=0:
+                start=pos+pm.start(1)
+                fs['项目名称']=cell(project,evidence(offsets,start,start+len(project)),'title-inference','needs_review')
+            else:
+                # 标题来自版头 OCR 或附件名兜底，正文中无对应文本，不做字符定位；
+                # 方法与证据跟随标题来源，避免把推断值伪装成原文直取。
+                fs['项目名称']=cell(project,ocr_ev if fs['标题']['method']==ocr_method else [],fs['标题']['method'],'needs_review')
     # Section headings may wrap: boundary from next numbered heading, not page.
     headings=[]
     for a,b,l in offsets:
@@ -163,15 +345,26 @@ def extract(path,name,doc_id,use_llm=False):
             if v:fs[key]=cell(v,evidence(offsets,a,b))
     take_section('建设内容',['建设内容','建设规模'])
     take_section('建设地点',['选址','建设地点'])
-    fs['建设周期']=found(text,offsets,r'(?:项目建设工期为|建设工期为|工期为|建设周期为)(约?\d+(?:\.\d+)?(?:个月|月|年))')
-    fs['项目单位']=found(text,offsets,r'(?:项目业主|建设单位)[：:]?([\u4e00-\u9fff]{3,40}(?:公司|局|委员会))')
+    # 工期写法多样：除"建设工期为"，地方批复也用"工程实施周期24个月"这类表述。
+    fs['建设周期']=found(text,offsets,r'(?:项目建设工期为|建设工期为|工期为|建设周期为|(?:工程)?实施周期)(约?\d+(?:\.\d+)?(?:个月|月|年))')
+    fs['项目单位']=found(text,offsets,r'(?:项目业主|建设单位)[：:]?([\u4e00-\u9fff]{3,40}'+ORG+r')')
     if not fs['项目单位']['value']:
-        # The addressee is direct textual evidence; flag its role as an inference.
-        tpos=text.find(title)+len(title) if title else 0
-        m=re.match(r'([\u4e00-\u9fff]{3,40}(?:公司|局|委员会))：',text[tpos:])
-        if m:fs['项目单位']=cell(m.group(1),evidence(offsets,tpos,tpos+m.end(1)),'addressee','needs_review')
+        # 主送机关（收件人）是正文内的直接证据，紧跟在发文字号之后，位置随版式浮动
+        # （红头/标题为图片的公文，正文可能从页高 60% 处才起），故既不能按标题偏移锚定，
+        # 也不能用固定页高比例截断。改为以「发文字号行」为锚点向后取整行匹配，
+        # 证据直接用该行自身的 id/bbox，保证高亮定位准确。
+        p1=[l for _,_,l in offsets if l['page']==1]
+        start=0
+        for i,l in enumerate(p1):
+            if re.fullmatch(DOC_NUMBER_RE,l['text'].strip()):
+                start=i+1;break
+        for l in p1[start:start+4]:
+            m=re.fullmatch(r'([\u4e00-\u9fff]{3,40}'+ORG+r')[：:]',l['text'].strip())
+            if m:
+                fs['项目单位']=cell(m.group(1),[{'id':l['id'],'page':l['page'],'bbox':l['bbox'],'quote':m.group(1)}],'addressee','needs_review')
+                break
     for key,pattern in [
-      ('总投资/匡算/估算/概算',r'((?:项目)?(?:估算总投资|概算总投资|投资概算|总投资|投资匡算)(?:为)?约?\d+(?:\.\d+)?(?:万元|亿元))'),
+      ('总投资/匡算/估算/概算',r'((?:项目|工程|本工程|本项目)?(?:估算总投资|概算总投资|投资概算|投资估算|总投资|投资匡算)(?:为)?约?\d+(?:\.\d+)?(?:万元|亿元))'),
       ('资金来源',r'((?:建设资金|所需建设资金|所需资金)[^。]+)')]:
         fs[key]=found(text,offsets,pattern)
     fs['印章']=stamps(path,pages)
@@ -190,11 +383,17 @@ def extract(path,name,doc_id,use_llm=False):
     # Restrict to construction sections and explicit measurement nouns.
     covered=[(e['id'],m['value']) for m in metrics for e in m['evidence']]
     for h,a,b,v in areas:
-        pattern=r'([\u4e00-\u9fffA-Za-z]{2,25}(?:面积|高度|宽度|长度|容量|功率|数量|层高))(?:为)?(约?'+NUM+r'(?:'+UNIT+r'))'
+        # 后缀原表偏房建/公路（面积/宽度/涵洞等）；补入市政管网常用量词与
+        # 里程/路段类标签（"实施总里程5.374km""路线长100.37m""管径De400长度3700米"），
+        # 否则管网、截污纳管、给排水、公路改造类批复的建设指标会全部为空。
+        # 标签字符类含数字，因为标签与数值之间常夹着规格号（管径De400长度3700米）。
+        pattern=r'([\u4e00-\u9fffA-Za-z0-9]{2,25}(?:面积|高度|宽度|长度|容量|功率|数量|层高|里程|管道|管|管线|管网|网|井|口|座|处|孔|根|条|台|套|站|盏|株|段|路|长|桥|涵))(?:为)?(约?'+NUM+r'(?:'+UNIT+r'))'
         for m in re.finditer(pattern,v):
             ev=evidence(offsets,a+m.start(),a+m.end())
             if any(e['id']==lineid and m.group(2) in value for e in ev for lineid,value in covered):continue
             label=re.sub(r'^(?:项目|其中|主要|设置|新建|总计)', '', m.group(1))
+            # 去掉夹在标签里的规格号（"管径De400长度"→"长度"），保留可读的指标名。
+            label=re.sub(r'^.*?\d+(?=[\u4e00-\u9fff])','',label) or m.group(1)
             if (label,m.group(2)) not in seen:
                 seen.add((label,m.group(2)))
                 metrics.append({'name':label,**cell(m.group(2),ev), 'normalized':numeric(m.group(2)), 'scope':'construction' if ('建设内容' in h or '建设规模' in h) else 'design'})
@@ -214,11 +413,7 @@ def extract(path,name,doc_id,use_llm=False):
         try:verify_seal(result,path)
         except Exception as exc:result['warnings'].append('印章视觉确认失败：'+(str(exc) if isinstance(exc,ModelError) else type(exc).__name__))
     # No silent merging of conflicting measurements in one document.
-    for label in {x['name'] for x in result['metrics']}:
-        hits=[x for x in result['metrics'] if x['name']==label]
-        if len({x['value'] for x in hits})>1:
-            for x in hits:x['status']='conflict'
-            result['warnings'].append(f'指标“{label}”存在多个值，请核对统计范围。')
+    mark_conflicts(result)
     fs=result['fields']
     result['project_key']=fs['项目代码']['value'] or ('unassigned:'+doc_id)
     result['project_name']=fs['项目名称']['value'] or name
