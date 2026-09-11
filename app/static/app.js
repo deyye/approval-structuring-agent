@@ -140,8 +140,27 @@ function renderReview(g) {
     const ul=node('ul',undefined,'review-list');
     for (const a of (r.alignments||[])) {
       const li=node('li');
-      li.append(node('span','指标对齐','doc'),node('span',a.name+' ↔ '+(a.align_with||[]).join('、'),'val'));
-      li.append(node('span','数值相同但各阶段名称不同，疑似同一指标，请确认是否合并','why'));
+      const names=a.names||[];
+      li.append(node('span','指标对齐','doc'),
+                node('span',names.join(' ↔ ')+'（均为 '+(a.value||'同一数值')+'）','val'));
+      // 合并/不合并必须都能落地：只在表里标黄而不给处理入口，这一项会永远
+      // 留在待办里，项目也就永远到不了「已审完」。
+      for (const target of names) {
+        const other=names.find(n=>n!==target);
+        const holder=(a.holders||[]).find(h=>h.name===other);
+        if (!holder) continue;
+        const b=node('button','统一为「'+target+'」');
+        b.onclick=()=>resolveAlign(holder,other,target,'merge');
+        li.append(b);
+      }
+      const keepHolder=(a.holders||[])[0];
+      if (keepHolder) {
+        const n=keepHolder.name, other=names.find(x=>x!==n)||'';
+        const k=node('button','确认不合并');
+        k.onclick=()=>resolveAlign(keepHolder,n,other,'keep');
+        li.append(k);
+      }
+      li.append(node('span',a.why,'why'));
       ul.append(li);
     }
     for (const d of r.documents) for (const it of d.items) {
@@ -162,6 +181,20 @@ function gotoItem(g,docId,it) {
   const row=g.rows.find(r=>r.kind===it.kind&&r.name===it.name);
   if (!doc||!row) return;
   selectCell(doc,row,row.cells[g.documents.indexOf(doc)],it.index);
+}
+// 处理「疑似同一指标」：merge 把本文件里的指标改名为对方名称（两行合并），
+// keep 只记录「确实不是同一指标」的判断。两者都会让该项目少一项待办。
+async function resolveAlign(holder,name,other,decision) {
+  try {
+    const doc=await api('/api/documents/'+holder.doc);
+    await api('/api/documents/'+holder.doc+'/review',{kind:'align',name,other,decision,value:'',
+      reason:decision==='merge'?'跨阶段指标名称对齐：合并为同一指标':'跨阶段指标名称对齐：确认不是同一指标',
+      revision:doc.revision??0});
+    await refresh();
+    toast(decision==='merge'
+      ? '已把「'+name+'」统一为「'+other+'」，比对已重新计算。'
+      : '已确认两者不是同一指标，该项不再计入待办。');
+  } catch(e) {toast(e.message);}
 }
 // 自检循环的记录：用户能看见系统在想什么，「流程不直观」才有解。
 function renderAgent(g) {

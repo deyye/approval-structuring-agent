@@ -87,12 +87,37 @@ def absent_items(doc):
             if not c.get('value') and c.get('reason') == 'absent']
 
 
-def alignment_items(rows):
+def align_pair_key(a, b):
+    """一对疑似同一指标的稳定键。顺序无关，用于判断这对是否已被人工处理过。"""
+    return '｜'.join(sorted((a, b)))
+
+
+def _align_decided(docs):
+    """已被人工处理过的对齐对。判据是修订历史里出现过 kind='align' 的记录。
+
+    必须单独记这种处理：合并会把指标改名、不合并则什么都不改，两者都不会让
+    指标状态发生变化，只能靠历史记录区分「还没人看过」与「已确认过、本来就
+    不是同一指标」。
+    """
+    decided = set()
+    for d in docs:
+        for h in d.get('history', []):
+            if h.get('kind') == 'align' and isinstance(h.get('name'), str):
+                decided.add(h['name'])
+    return decided
+
+
+def alignment_items(rows, docs=None, decided=None):
     """跨阶段疑似同一指标的提示，同样需要人工决定是否合并。
 
     一对疑似指标会在两行上各标一次（比对表两行都要变色提示），但待办清单里
     只应出现一条——否则同一件事数两遍，进度永远清不了零。
+
+    `holders` 指明每个名称分别落在哪份文件、第几条指标，界面据此发起处理动作；
+    已由人工处理过的对不再出现。
     """
+    decided = decided or set()
+    docs = docs or []
     seen = set()
     out = []
     for r in rows:
@@ -100,11 +125,22 @@ def alignment_items(rows):
             continue
         for other in r['align_with']:
             pair = tuple(sorted((r['name'], other)))
-            if pair in seen:
+            key = align_pair_key(*pair)
+            if pair in seen or key in decided:
                 continue
             seen.add(pair)
-            out.append({'names': list(pair), 'name': pair[0], 'align_with': [pair[1]],
-                        'why': '数值相同但各阶段名称不同，疑似同一指标，请确认是否合并'})
+            item = {'names': list(pair), 'name': pair[0], 'align_with': [pair[1]],
+                    'key': key, 'value': '', 'holders': [],
+                    'why': '数值相同但各阶段名称不同，疑似同一指标，请确认是否合并'}
+            for n in pair:
+                for d in docs:
+                    for i, m in enumerate(d.get('metrics', [])):
+                        if m['name'] == n:
+                            item['holders'].append({'name': n, 'doc': d['id'], 'stage': d['stage'],
+                                                    'filename': d['filename'], 'index': i})
+                            if not item['value'] and m.get('value'):
+                                item['value'] = m['value']
+            out.append(item)
     return out
 
 
@@ -122,7 +158,7 @@ def project_progress(docs, rows=None):
         })
     touched = sum(1 for d in docs for h in d.get('history', [])
                   if h.get('kind') in ('fixed', 'metric'))
-    align = alignment_items(rows or [])
+    align = alignment_items(rows or [], docs, _align_decided(docs))
     if total == 0 and not align:
         status = '已审完'
     elif touched == 0:
