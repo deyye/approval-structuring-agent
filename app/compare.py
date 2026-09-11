@@ -45,7 +45,7 @@ def rows_for(docs):
                     status='equivalent' if len({c['value'] for c in cs})>1 else status
             # 与指标同一套书写精度宽容：金额/工期只因四舍五入而略差时，
             # 不报成「内容变化」，但仍保留原有投资口径提示。
-            if status=='different' and rounding_equivalent(ns,cs):
+            if status=='different' and (name=='建设周期' or len(set(basis))==1) and rounding_equivalent(ns,cs):
                 status='equivalent'
                 note=_rounding_note(ns,[c.get('value') for c in cs])
             if name=='总投资/匡算/估算/概算' and len(set(basis))>1:note='投资口径：'+' → '.join(basis)+'；阶段金额变化不直接认定为异常。'

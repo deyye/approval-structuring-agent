@@ -173,7 +173,7 @@ function renderReview(g) {
     box.append(ul);
   }
   const absent=r.documents.reduce((n,d)=>n+d.absent.length,0);
-  if (absent) box.append(node('p','另有 '+absent+' 个空值已检索全文并确认原文未载明，不计入待办；如需改动可在单文档视图中处理。','review-note'));
+  if (absent) box.append(node('p','另有 '+absent+' 个空值未检出相关线索，暂不计入待办；这不等于人工确认原文未载明，交付前请对照原文抽查。','review-note'));
 }
 function gotoItem(g,docId,it) {
   if (state.docId!==docId) {state.docId=docId;render();}

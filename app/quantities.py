@@ -88,11 +88,15 @@ def round_tolerance(raw):
 def rounding_equivalent(items,cells):
     """一组可比值是否只是「书写精度/约数」差异。items 与 cells 必须一一对应。
 
-    要求：同单位、同维度、都非区间、极差不超过其中最大的书写精度容差。
+    要求：同单位、同维度、都非区间、非上下限且非离散计数，极差不超过最大的书写精度容差。
     只要有一个值无法判定精度，就不宽容——宁可报差异，也不吞掉真实变化。
     """
     if len(items)<2:return False
     if any(n is None for n in items):return False
+    if len(items)!=len(cells):return False
+    # Bounds are requirements, not rounding noise; counts are discrete quantities.
+    if any(re.search(r'不超过|不少于|不低于|不高于|以上|以下',n['qualifier']) for n in items):return False
+    if any(n['dimension'].startswith('count:') for n in items):return False
     if any(n['upper'] is not None for n in items):return False
     if len({n['unit'] for n in items})!=1 or len({n['dimension'] for n in items})!=1:return False
     tol=None

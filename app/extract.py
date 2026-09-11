@@ -399,25 +399,27 @@ def extract(path,name,doc_id,use_llm=False):
     # Construction and design sections only; never mine numbering / cost appendix.
     areas=[s for s in sec if any(w in s[0] for w in METRIC_SECTIONS)]
     seen=set()
+    covered_spans=[]
     for label,pat in METRICS:
         for h,a,b,v in areas:
             for m in re.finditer(r'(?:'+pat+r')(?:为)?('+VALUE+r')',v):
+                covered_spans.append((a+m.start(1),a+m.end(1)))
                 key=(label,m.group(1))
                 if key in seen:continue
                 seen.add(key)
                 metrics.append({'name':label,**cell(m.group(1),evidence(offsets,a+m.start(),a+m.end())), 'normalized':numeric(m.group(1)), 'scope':'construction' if ('建设内容' in h or '建设规模' in h) else 'design'})
     # Unknown numeric attributes: preserve their original labels, with evidence.
     # Restrict to construction sections and explicit measurement nouns.
-    covered=[(e['id'],m['value']) for m in metrics for e in m['evidence']]
     for h,a,b,v in areas:
         # 后缀原表偏房建/公路（面积/宽度/涵洞等）；补入市政管网常用量词与
         # 里程/路段类标签（"实施总里程5.374km""路线长100.37m""管径De400长度3700米"），
         # 否则管网、截污纳管、给排水、公路改造类批复的建设指标会全部为空。
         # 标签字符类含数字，因为标签与数值之间常夹着规格号（管径De400长度3700米）。
-        pattern=r'([\u4e00-\u9fffA-Za-z0-9]{2,25}(?:面积|高度|宽度|长度|容量|功率|数量|层高|里程|管道|管|管线|管网|网|井|口|座|处|孔|根|条|台|套|站|盏|株|段|路|长|桥|涵))(?:为)?(约?'+NUM+r'(?:'+UNIT+r'))'
+        pattern=r'([\u4e00-\u9fffA-Za-z0-9]{2,25}(?:面积|高度|宽度|长度|容量|功率|数量|层高|里程|管道|管|管线|管网|网|井|口|座|处|孔|根|条|台|套|站|盏|株|段|路|长|桥|涵))(?:为)?('+VALUE+r')'
         for m in re.finditer(pattern,v):
             ev=evidence(offsets,a+m.start(),a+m.end())
-            if any(e['id']==lineid and m.group(2) in value for e in ev for lineid,value in covered):continue
+            # Deduplicate the matched occurrence, not an equal value elsewhere on the line.
+            if any(start < a+m.end(2) and a+m.start(2) < end for start,end in covered_spans):continue
             label=re.sub(r'^(?:项目|其中|主要|设置|新建|总计)', '', m.group(1))
             # 去掉夹在标签里的规格号（"管径De400长度"→"长度"），保留可读的指标名。
             label=re.sub(r'^.*?\d+(?=[\u4e00-\u9fff])','',label) or m.group(1)
