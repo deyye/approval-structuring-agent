@@ -22,6 +22,33 @@ HEADER_NOISE = ['浙江政务服务网', '投资在线平台', '投资项目在�
                 '工程审批系统']
 # 整页墨迹占比低于该值视为空白页（仅版式水印，无正文），不报"需复核"。
 INK_BLANK_RATIO = 0.004
+# 建设指标可采矿的章节判据。原表偏房建/市政常见章节名，对水利、生态修复类批复
+# 会整段漏采（实测「二、工程任务和规模」这类章节下一条指标都取不到）。
+# 「规模」「工程布置」「工程任务」经逐词归因可零噪声召回这类章节；而「设计」
+# 「技术标准」会误抓「原则同意XX设计有限公司编制…」等噪声，故不采用。
+METRIC_SECTIONS = ['建设内容','建设规模','建筑设计','设施设计','铺装设计','给排水设计',
+                   '工程任务','工程布置','规模']
+# 空字段的两种原因，供比对与界面区分显示。
+MISSING_REASONS = {'absent':'原文未载明（已检索全文）','unextracted':'原文有线索但未提取到'}
+# 判断「原文有线索却没抽到」所用的判据。判据必须指向该要素本身，不能只匹配
+# 泛关键词，否则会把章节标题也算成线索。
+# 「印发机关」刻意不设线索：它由版记结构专门定位（find_imprint 要求页面下半部
+# 出现独立的机关署名行），没有候选即确属版记未署机关，不应再报「有线索未抽到」
+# 而制造假告警——实测庆元三份正是这种情形。
+MISSING_CUES = {
+    '发文字号': DOC_NUMBER_RE,
+    '标题': r'关于.{3,100}?的批复',
+    '印发日期': r'\d{4}年\d{1,2}月\d{1,2}日印发',
+    '项目名称': r'关于(.+?)(?:项目建议书|可行性研究报告|初步设计|立项申请|项目申请报告|核准)的批复',
+    '项目代码': r'\d{4}-\d{6}-\d{2}-\d{2}-\d{6}',
+    '项目单位': r'(?:项目业主|建设单位|项目单位)',
+    '建设内容': r'(?:建设内容|建设规模|主要建设)',
+    '建设地点': r'(?:项目|工程|建设)地[址点]|选址',
+    '总投资/匡算/估算/概算': r'(?:投资估算|概算|总投资|投资匡算|估算总投资|概算总投资)',
+    '资金来源': r'(?:资金来源|建设资金|所需资金|运营资金)',
+    '建设周期': r'(?:工期|建设周期|实施周期|建设期)',
+    '发文机关标志': r'[\u4e00-\u9fff]{2,25}(?:局|委员会|政府|办公室)文件',
+}
 from .quantities import NUM, UNIT, VALUE, numeric
 
 def clean(s): return re.sub(r'\s+', '', s or '')
@@ -370,7 +397,7 @@ def extract(path,name,doc_id,use_llm=False):
     fs['印章']=stamps(path,pages)
     metrics=[]
     # Construction and design sections only; never mine numbering / cost appendix.
-    areas=[s for s in sec if any(w in s[0] for w in ['建设内容','建设规模','建筑设计','设施设计','铺装设计','给排水设计'])]
+    areas=[s for s in sec if any(w in s[0] for w in METRIC_SECTIONS)]
     seen=set()
     for label,pat in METRICS:
         for h,a,b,v in areas:
@@ -412,12 +439,42 @@ def extract(path,name,doc_id,use_llm=False):
     if use_llm and os.getenv('VISION_MODEL'):
         try:verify_seal(result,path)
         except Exception as exc:result['warnings'].append('印章视觉确认失败：'+(str(exc) if isinstance(exc,ModelError) else type(exc).__name__))
+    # 空字段要给出原因：原文确无该要素，还是原文有线索却没抽到。
+    mark_missing_reason(result,text)
     # No silent merging of conflicting measurements in one document.
     mark_conflicts(result)
     fs=result['fields']
     result['project_key']=fs['项目代码']['value'] or ('unassigned:'+doc_id)
     result['project_name']=fs['项目名称']['value'] or name
-    result['quality']={'evidence_fields':sum(bool(c['evidence']) for c in fs.values()),'review_fields':sum(c['status'] in ['needs_review','conflict','uncertain'] for c in fs.values())}
+    recompute_quality(result)
+    return result
+
+def recompute_quality(result):
+    """重算文档质量摘要。
+
+    独立成函数是为了让自检循环（app/agent_loop.py）在追加指标或补回字段之后
+    能刷新它——否则 quality 停留在动手之前，界面与导出拿到的都是陈旧值。
+    """
+    fs=result['fields']
+    result['quality']={
+        'evidence_fields':sum(bool(c['evidence']) for c in fs.values()),
+        'review_fields':sum(c['status'] in ['needs_review','conflict','uncertain'] for c in fs.values()),
+        'missing_absent':sum(c.get('reason')=='absent' for c in fs.values()),
+        'missing_unextracted':sum(c.get('reason')=='unextracted' for c in fs.values()),
+    }
+    return result
+
+def mark_missing_reason(result,text):
+    """给「空字段」补一个原因：原文确无该要素，还是原文有线索却没抽到。
+
+    两者混在一起有两个坏处：正确的缺失看起来像系统故障——实测庆元三份的
+    「印发机关」版记里确实没有独立署名行，却连续出现三个空格子；而真正的
+    漏抽又淹没在同样的灰格里，没人会去处理。
+    """
+    for key,c in result['fields'].items():
+        if c.get('value') or c.get('status')!='missing':continue
+        cue=MISSING_CUES.get(key)
+        c['reason']='unextracted' if (cue and re.search(cue,text)) else 'absent'
     return result
 
 def augment_llm(result):

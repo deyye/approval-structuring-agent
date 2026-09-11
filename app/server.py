@@ -8,9 +8,28 @@ import fitz
 from .extract import extract,FIELDS,STAGES,numeric
 from .compare import rows_for,export_xlsx
 from .review import update as apply_review
+from .queue import project_progress
+from . import agent_loop
 from .model_client import public_config, probe, ModelError
 
 ROOT=Path(__file__).resolve().parent.parent
+
+# 任务表（s.jobs）是纯内存结构，不清会随运行时间单调增长，重启又会全丢。
+# 只保留最近这么多条已结束的任务。
+MAX_KEPT_JOBS=50
+
+def diagnose(result,path,name,doc_id):
+    """按需启动自检循环，并保证它失败时不影响主流程。
+
+    只在自检发现异常时才跑：实测 6 份真实批复主干全部正常、自检零信号，
+    循环一次都不会启动；若每份都跑，放宽形态带来的认错风险会摊到全部文档。
+    """
+    try:
+        if agent_loop.should_run(result):
+            result=agent_loop.run_agent(path,name,doc_id,result=result)
+    except Exception as exc:
+        result.setdefault('warnings',[]).append('自检循环执行失败，已保留本地提取结果：'+type(exc).__name__)
+    return result
 
 def load_env():
     p=ROOT/'.env'
@@ -35,11 +54,19 @@ class Store:
         with self.lock:
             p=self.path/(d['id']+'.json');temp=p.with_suffix('.tmp')
             temp.write_text(json.dumps(d,ensure_ascii=False),encoding='utf-8');temp.replace(p)
+    def prune_jobs(self):
+        """只保留最近 MAX_KEPT_JOBS 条已结束的任务，未结束的一律保留。"""
+        with self.lock:
+            if len(self.jobs)<=MAX_KEPT_JOBS:return
+            for jid in list(self.jobs):
+                if len(self.jobs)<=MAX_KEPT_JOBS:break
+                if self.jobs[jid].get('status')!='running':self.jobs.pop(jid,None)
     def reprocess(self,jid,docid,llm):
         job=self.jobs[jid]
         try:
             original=self.get(docid)
-            fresh=extract(self.path/(docid+'.pdf'),original['filename'],docid,llm)
+            pdf=self.path/(docid+'.pdf')
+            fresh=diagnose(extract(pdf,original['filename'],docid,llm),pdf,original['filename'],docid)
             with self.lock:
                 current=self.get(docid)
                 for k,old in current['fields'].items():
@@ -67,12 +94,14 @@ class Store:
                 try:d=extract(p,name,i,llm)
                 except Exception:
                     p.unlink(missing_ok=True);raise
+                d=diagnose(d,p,name,i)
                 d.update(sha256=digest,created_at=time.time(),history=[],revision=0)
                 self.save(d);job['results'].append({'id':i,'filename':name})
             except Exception as e:
                 job['errors'].append({'filename':name,'message':str(e) if isinstance(e,ValueError) else '解析失败：'+type(e).__name__})
             finally:job['done']+=1
         job['status']='completed'
+        self.prune_jobs()
 
 class Handler(BaseHTTPRequestHandler):
     server_version='ApprovalAgent/1.0'
@@ -98,7 +127,14 @@ class Handler(BaseHTTPRequestHandler):
         if p=='/api/documents':
             ds=s.list();groups={}
             for d in ds:groups.setdefault(d['project_key'],[]).append(d)
-            return self.send({'groups':[{'key':key,'name':v[0]['project_name'],'documents':rows_for(v)[0],'rows':rows_for(v)[1]} for key,v in groups.items()]})
+            out=[]
+            for key,v in groups.items():
+                docs,rows=rows_for(v)
+                # review 是项目级完成度与待办清单：让用户能回答
+                #「这个项目还剩多少没核对完」，而不是只看单个格子的颜色。
+                out.append({'key':key,'name':docs[0]['project_name'],'documents':docs,'rows':rows,
+                            'review':project_progress(docs,rows)})
+            return self.send({'groups':out})
         if p.startswith('/api/jobs/'):
             jid=p.rsplit('/',1)[-1]
             if jid not in s.jobs:return self.send({'error':'任务不存在'},404)
@@ -141,11 +177,18 @@ class Handler(BaseHTTPRequestHandler):
             finally:self.server.store.model_probe_lock.release()
         if p=='/api/upload':
             fs=data.get('files',[])
-            if not 1<=len(fs)<=10:raise ValueError('一次上传1至10份PDF')
+            if not isinstance(fs,list) or not 1<=len(fs)<=10:raise ValueError('一次上传1至10份PDF')
             items=[]
             for f in fs:
+                # 逐项校验结构：缺字段时直接抛 ValueError 给出可读提示，
+                # 否则会漏出「list indices must be integers or slices」这类
+                # 只有开发者看得懂的解释器报错。
+                if not isinstance(f,dict):raise ValueError('上传内容格式无效：每份文件需包含文件名与内容')
+                if not isinstance(f.get('name'),str) or not f['name'].strip():raise ValueError('上传内容格式无效：文件名缺失')
+                if not isinstance(f.get('data'),str) or not f['data'].strip():raise ValueError('上传内容格式无效：文件内容缺失')
                 name=Path(f['name']).name[:180]
-                blob=base64.b64decode(f['data'],validate=True)
+                try:blob=base64.b64decode(f['data'],validate=True)
+                except Exception:raise ValueError('上传内容格式无效：文件内容无法解码') from None
                 if not name.lower().endswith('.pdf') or not blob.startswith(b'%PDF-'):raise ValueError('仅支持PDF文件')
                 if len(blob)>20*1024*1024:raise ValueError('单份文件不得超过20MB')
                 items.append((name,blob))

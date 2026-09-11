@@ -19,16 +19,21 @@ import json
 import os
 import re
 
-from .extract import cell, evidence, extract, mark_conflicts
+from .extract import cell, evidence, extract, mark_conflicts, recompute_quality, METRIC_SECTIONS
 from .quantities import numeric
 
 MAX_ATTEMPTS = 3
 
-# 主干当前使用的章节判据（与 extract.py 保持一致，作为对照基线）
+# 改动前主干使用的章节判据，保留为历史基线（测试与对照审计仍按它比较）。
 SECTION_WORDS = ['建设内容', '建设规模', '建筑设计', '设施设计', '铺装设计', '给排水设计']
+# 主干**现在**实际采矿的章节判据。直接引用 extract.METRIC_SECTIONS，
+# 两边不再各留一份——这两张表曾漂移过（agent 里放宽了、主干里没放宽），
+# 结果是同一份批文在两条路径上得到不同的章节集合。
+TRUNK_SECTIONS = METRIC_SECTIONS
 # 放宽后的章节判据：补入工程类公文的常见章节名。
 # 经 47 份语料逐词归因，「规模」可零噪声救回「工程任务和规模」，
 # 而「设计」「技术标准」会误抓「原则同意XX设计有限公司编制…」等噪声，故不采用。
+# 这三个词已并入主干（见 extract.METRIC_SECTIONS），此处保留以兼容对照审计。
 SECTION_WORDS_WIDE = SECTION_WORDS + ['规模', '工程布置', '工程任务']
 
 # 备用形态用的单位：只收无歧义的物理量，刻意排除 年/月（会把「2026年」当工期）
@@ -129,10 +134,16 @@ def self_check(result, ctx):
 
 
 def _dedup_add(result, label, value, ev, method):
+    """把补回来的指标并入结果。
+
+    这些指标用的形态是**放宽过的**，认错的风险高于主干。因此一律标
+    needs_review，与主干直接抽出的值在等级上分开——否则有风险的补救
+    和可靠的结果混在一起，人工分不出哪个该复核。
+    """
     if any(m['name'] == label and m['value'] == value for m in result['metrics']):
         return False
     result['metrics'].append({
-        'name': label, **cell(value, ev, method),
+        'name': label, **cell(value, ev, method, 'needs_review'),
         'normalized': numeric(value), 'scope': 'construction',
     })
     return True
@@ -144,7 +155,8 @@ def act_widen_sections(result, ctx):
     pat = re.compile(r'([\u4e00-\u9fffA-Za-z0-9]{2,25}(?:' + SUFFIXES + r'))(?:为)?'
                      r'(约?\d+(?:\.\d+)?(?:' + ALT_UNITS + r'))')
     for s in pick(ctx, SECTION_WORDS_WIDE):
-        if any(w in s['heading'] for w in SECTION_WORDS):
+        # 主干已覆盖的章节不再重扫；跳过的判据用主干当前词表，不用历史基线。
+        if any(w in s['heading'] for w in TRUNK_SECTIONS):
             continue
         for m in pat.finditer(s['text']):
             ev = evidence(ctx['offsets'], s['start'] + m.start(), s['start'] + m.end())
@@ -287,9 +299,24 @@ class LLMPlanner:
         return None
 
 
-def run_agent(path, name, doc_id, planner=None, max_attempts=MAX_ATTEMPTS):
-    """跑一遍 agent 循环。返回值含 trace，可逐步审计。"""
-    result = extract(path, name, doc_id, use_llm=False)
+def should_run(result):
+    """是否需要启动自检循环——上传与重新提取链路据此决定。
+
+    只在自检报出问题时才跑，是为了把「放宽办法」的认错风险限制在本来就
+    有问题的文档上，而不是摊到全部样本。实测 6 份真实批复主干全部正常，
+    自检零信号，循环一次都不会启动；没有这一步，放宽形态会被应用到每一份
+    批文上，把假阳性摊薄到全局。
+    """
+    return bool(self_check(result, snapshot(result['lines'])))
+
+
+def run_agent(path, name, doc_id, planner=None, max_attempts=MAX_ATTEMPTS, result=None):
+    """跑一遍 agent 循环。返回值含 trace，可逐步审计。
+
+    `result` 可传入已经抽好的结果（上传链路就是这种情况），避免为了跑一次
+    自检把同一份 PDF 再解析一遍。
+    """
+    result = result if result is not None else extract(path, name, doc_id, use_llm=False)
     ctx = snapshot(result['lines'])
     planner = planner or RulePlanner()
     trace, tried = [], set()
@@ -334,6 +361,13 @@ def run_agent(path, name, doc_id, planner=None, max_attempts=MAX_ATTEMPTS):
         result['warnings'].append('[agent/%s] %s' % (i['code'], i['detail']))
     result['agent'] = {'status': status, 'steps': len(trace), 'issues': remaining,
                        'trace': trace, 'planner': planner.name}
+    if trace:
+        # engine 标出自检循环真的动过手，否则导出的「来源」列看不出这份文档
+        # 的结果里混有补救值。
+        engines = result.get('engine') or 'local'
+        result['engine'] = engines if '+agent' in engines else engines + '+agent'
+    # 追加指标或补回字段之后必须重算质量摘要，否则 quality 停留在动手之前。
+    recompute_quality(result)
     return result
 
 

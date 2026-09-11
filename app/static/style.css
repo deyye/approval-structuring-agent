@@ -17,3 +17,36 @@ select:focus-visible{outline:3px solid #5a9dd0;outline-offset:2px}
 @media(max-width:680px){.toolbar{flex-wrap:wrap}.toolbar>label{padding:8px 0}.document-tools label{min-width:0;width:100%}#documentSelect{min-width:0;flex:1}header .top-actions{gap:8px}.brand strong{letter-spacing:2px}}
 
 .model-tests{display:flex;flex-wrap:wrap;gap:6px}.model-tests button{font-size:12px;padding:7px 9px}#modelTestResult{overflow-wrap:anywhere;margin:8px 0}
+
+/* 新增状态：疑似同一指标（紫）、原文有线索未提取到（红） */
+.align{background:#ede7f6;color:#4a3b78}
+.unextracted{background:#fde7e7;color:#8c2f2f}
+
+/* 项目完成度：让用户能回答「这个项目还剩多少没核对完」 */
+.review-panel{margin-bottom:15px;background:#fff;border:1px solid var(--border);border-radius:8px;padding:12px 14px}
+.review-head{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px;font-weight:bold}
+.review-head .progress{font-size:13px;font-weight:400;color:var(--muted)}
+.review-head .progress.done{color:#2f7d54}
+.review-empty{color:var(--muted);font-size:13px;margin:6px 0 0}
+.review-list{margin:10px 0 0;padding:0;list-style:none;max-height:260px;overflow:auto}
+.review-list li{margin-bottom:6px;font-size:13px;display:flex;flex-wrap:wrap;gap:6px;align-items:baseline}
+.review-list .doc{color:var(--muted);min-width:88px}
+.review-list .val{color:var(--ink);font-weight:600}
+.review-list button{padding:4px 9px;font-size:12px}
+.review-list .why{color:var(--muted);font-size:12px;flex-basis:100%}
+.review-note{font-size:12px;color:var(--muted);margin-top:8px}
+
+/* 自检循环的判断过程：这是整套系统最该被看见的部分 */
+.agent-panel{margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:8px;background:#fbfcfe;font-size:13px}
+.agent-panel h4{margin:0 0 8px;font-size:13px;color:var(--navy)}
+.agent-panel ol{margin:0;padding-left:20px}
+.agent-panel li{margin-bottom:6px;line-height:1.7}
+.agent-panel .why{color:var(--muted)}
+.agent-status{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;margin-left:6px}
+.agent-status.ok{background:#e5f3ea;color:#2f7d54}
+.agent-status.noted{background:#fff4e0;color:#8a5a12}
+.agent-status.escalated{background:#fde7e7;color:#8c2f2f}
+
+/* 侧栏项目条目上的核对进度 */
+.project-item small.progress{display:block;margin-top:5px;font-weight:600;color:#8a5a12}
+.project-item small.progress.done{color:#2f7d54}

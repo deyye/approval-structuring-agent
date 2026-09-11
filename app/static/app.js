@@ -1,18 +1,33 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const state = {groups: [], key: null, kind: 'fixed', docId: '', selection: null, page: 1, stages: [], evidenceIds: new Set()};
-const labels = {same:'一致',different:'内容变化',equivalent:'表述差异',missing:'未载明',review:'待核对'};
+const labels = {same:'一致',different:'内容变化',equivalent:'表述差异',missing:'未载明',review:'待核对',align:'疑似同一指标',unextracted:'原文有线索未提取到'};
 let toastTimer;
 // 说明每个值的来源与可信度，让复核者知道"为什么要确认"，而不是只看到一个红色状态。
+// 后端产出的每一种来源都必须在这里有解释：漏掉一种，那个值在用户眼里就是"来历不明"
+// ——大模型给的、自检循环补救的，会和规则直接抽出的一模一样，这与本系统
+// 「每个值都要有出处」的定位直接冲突。
 const methodNotes = {
   human: c => c.evidence_binding === 'reviewed' ? '此值及证据经人工复核。' : '此值经人工修订，以下仍为原提取证据。',
   'macos-vision': () => '本值由版头图片经 OCR 识别得到，可能存在识别误差，请对照原文版头核对。',
   tesseract: () => '本值由版头图片经 OCR 识别得到，可能存在识别误差，请对照原文版头核对。',
   'vision-required': () => '该要素位于图片层且未能识别出内容，请人工查看原文版头后再填。',
+  'vision-model': () => '本值由视觉模型复核印章候选得到，不鉴定印章真实性，请对照原文核对。',
   filename: () => '正文无该文本，值取自附件名推断，请核对。',
   'title-inference': () => '该值由标题推断而来，请核对事项口径。',
   addressee: () => '该值由主送机关（收件人）推断为项目单位，请核对角色。',
-  'visual-heuristic': () => '红色近圆形区域检测结果，请核对图像后确认；不鉴定真实性。'
+  'visual-heuristic': () => '红色近圆形区域检测结果，请核对图像后确认；不鉴定真实性。',
+  llm: () => '本值由大模型辅助抽取，其引用已通过原文校验，请按需核对。',
+  'agent-widen': () => '本值由自检循环放宽章节判据后补回，可信度低于主干直取，请核对。',
+  'agent-alt-form': () => '本值由自检循环换用备用识别形态补回，可信度低于主干直取，请核对。',
+  'agent-read': () => '本值由自检循环定点回读原文补回，可信度低于主干直取，请核对。'
+};
+// 自检循环的动作名，翻成业务语言，让用户看得懂它到底做了什么。
+const actionLabels = {
+  widen_sections: '放宽章节判据后重扫',
+  alt_form_metrics: '换用备用识别形态重抽',
+  read_section: '定点回读原文补字段',
+  escalate: '放弃自动修复并上报'
 };
 function methodNote(row, c) {
   if (row.name === '印章' && !methodNotes[c.method]) return '';
@@ -50,12 +65,16 @@ function render() {
   for (const item of state.groups) {
     const b = node('button',undefined,'project-item'+(item.key === state.key ? ' active':''));
     b.append(node('strong',item.name),node('small',item.documents.length+' 份批文 · '+new Set(item.documents.map(d=>d.stage)).size+' 个阶段'));
+    // 项目级完成度：让用户一眼看到「还剩多少没核对完」，而不是只看单个格子的颜色。
+    const rv = item.review;
+    if (rv) b.append(node('small', rv.pending === 0 ? '核对已审完' : '核对 ' + rv.label, 'progress' + (rv.pending === 0 ? ' done' : '')));
     b.onclick = () => {state.key=item.key;state.docId='';state.selection=null;render();resetEvidence();};
     $('projects').append(b);
   }
   $('empty').hidden=!!g; $('tableWrap').hidden=!g; $('warnings').hidden=true;
   $('documentSelect').replaceChildren(option('','项目阶段对照'));
-  if (!g) {resetEvidence();return;}
+  if (!g) {resetEvidence();renderReview(null);renderAgent(null);return;}
+  renderReview(g);
   for (const d of g.documents) $('documentSelect').append(option(d.id,'单文档 · '+d.stage+' · '+d.filename));
   $('documentSelect').value=state.docId; $('singleTools').hidden=!state.docId;
   if (state.docId) $('stageSelect').value=g.documents.find(d=>d.id===state.docId).stage;
@@ -77,9 +96,15 @@ function render() {
     tr.append(name);
     for (const i of indices) {
       const c=row.cells[i];
-      const status=['needs_review','conflict','uncertain'].includes(c.status)?'review':c.value==null?'missing':state.docId?'same':row.status;
+      // 「原文确实没有」与「系统没抽到」必须分开显示：混在一起时，正确的缺失
+      // 看起来像系统故障（实测庆元三份的印发机关连开三个空格子），而真正的漏抽
+      // 又淹没在同样的灰格里没人处理。
+      const status=['needs_review','conflict','uncertain'].includes(c.status)?'review'
+        :(c.value==null&&c.reason==='unextracted')?'unextracted'
+        :c.value==null?'missing':state.docId?'same':row.status;
       const td=node('td',undefined,status),b=node('button',undefined,'cell-button');
-      b.append(node('span',c.value??(c.status==='uncertain'?'识别不确定':'未载明'),'cell-value'));
+      const blank=c.status==='uncertain'?'识别不确定':(c.reason==='unextracted'?'未提取到（原文有线索）':'原文未载明');
+      b.append(node('span',c.value??blank,'cell-value'));
       b.append(node('small',c.evidence.length?'查看原文 · 第 '+[...new Set(c.evidence.map(e=>e.page))].join('、')+' 页':'无可定位证据'));
       b.dataset.documentId=g.documents[i].id;b.dataset.field=row.name;
       b.setAttribute('aria-pressed',String(state.selection?.doc.id===g.documents[i].id&&state.selection?.row.name===row.name));
@@ -96,6 +121,74 @@ function render() {
     const details=node('details'),ul=node('ul');details.append(node('summary','处理提示 · '+warnings.length+' 项'));
     warnings.forEach(w=>ul.append(node('li',w)));details.append(ul);$('warnings').replaceChildren(details);$('warnings').hidden=false;
   }
+  renderAgent(g);
+}
+// 待办总览：把「还需要人工判断」的值收成一份可逐条确认的清单，并给出项目级进度。
+// 这是本系统最缺的一条主线——原先只有单个格子的颜色，用户永远不知道什么时候能收工。
+function renderReview(g) {
+  const box=$('reviewPanel');
+  if (!g || !g.review) {box.hidden=true;return;}
+  const r=g.review;
+  box.replaceChildren();box.hidden=false;
+  const head=node('div',undefined,'review-head');
+  head.append(node('span','核对进度'),
+    node('span',r.pending===0?'已审完（'+r.touched+' 处人工确认）':r.status+' · '+r.label,'progress'+(r.pending===0?' done':'')));
+  box.append(head);
+  if (r.pending===0) {
+    box.append(node('p','全部待办项已处理完毕，可以导出归档。','review-empty'));
+  } else {
+    const ul=node('ul',undefined,'review-list');
+    for (const a of (r.alignments||[])) {
+      const li=node('li');
+      li.append(node('span','指标对齐','doc'),node('span',a.name+' ↔ '+(a.align_with||[]).join('、'),'val'));
+      li.append(node('span','数值相同但各阶段名称不同，疑似同一指标，请确认是否合并','why'));
+      ul.append(li);
+    }
+    for (const d of r.documents) for (const it of d.items) {
+      const li=node('li');
+      const btn=node('button','去核对');btn.onclick=()=>gotoItem(g,d.id,it);
+      li.append(node('span',d.stage,'doc'),node('span',it.name+'：'+(it.value??'（空）'),'val'),btn,
+                node('span',it.why,'why'));
+      ul.append(li);
+    }
+    box.append(ul);
+  }
+  const absent=r.documents.reduce((n,d)=>n+d.absent.length,0);
+  if (absent) box.append(node('p','另有 '+absent+' 个空值已检索全文并确认原文未载明，不计入待办；如需改动可在单文档视图中处理。','review-note'));
+}
+function gotoItem(g,docId,it) {
+  if (state.docId!==docId) {state.docId=docId;render();}
+  const doc=g.documents.find(d=>d.id===docId);
+  const row=g.rows.find(r=>r.kind===it.kind&&r.name===it.name);
+  if (!doc||!row) return;
+  selectCell(doc,row,row.cells[g.documents.indexOf(doc)],it.index);
+}
+// 自检循环的记录：用户能看见系统在想什么，「流程不直观」才有解。
+function renderAgent(g) {
+  const box=$('agentPanel');
+  const doc=g&&state.docId?g.documents.find(d=>d.id===state.docId):null;
+  const agent=doc&&doc.agent;
+  if (!agent) {box.hidden=true;return;}
+  box.replaceChildren();box.hidden=false;
+  const h=node('h4','自检循环记录');
+  const words={ok:'已收敛',noted:'有提示',escalated:'转人工复核'};
+  h.append(node('span',words[agent.status]||agent.status,'agent-status '+(agent.status||'noted')));
+  box.append(h);
+  if (!(agent.trace||[]).length) {
+    box.append(node('p','本次未发现异常，未执行任何补救动作。','muted'));
+  } else {
+    const ol=node('ol');
+    for (const t of agent.trace) {
+      const li=node('li');
+      li.append(node('span','发现「'+(t.issues||[]).join('、')+'」→ 执行「'+(actionLabels[t.action]||t.action)
+        +'」（'+(t.decided_by==='llm'?'模型决策':'规则决策')+'）→ '+t.note));
+      if (t.reason) li.append(node('span','；'+t.reason,'why'));
+      ol.append(li);
+    }
+    box.append(ol);
+  }
+  const left=(agent.issues||[]);
+  if (left.length) box.append(node('p','仍需人工处理：'+left.map(i=>i.detail).join('；'),'why'));
 }
 function resetEvidence() {$('evidenceEmpty').hidden=false;$('evidenceContent').hidden=true;$('evidenceStatus').textContent='选择表格中的字段';}
 function selectCell(doc,row,c,index=null) {

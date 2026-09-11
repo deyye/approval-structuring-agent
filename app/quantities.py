@@ -59,3 +59,47 @@ def numeric(raw):
 def quantity_key(n):
     if not n:return None
     return (Decimal(n['number']),Decimal(n['upper']) if n['upper'] is not None else None,n['unit'],n['qualifier'])
+
+def round_tolerance(raw):
+    """由「原值的书写精度」推出允许的等价容差（标准化单位）；无法判定时返回 None。
+
+    实测动机：真实批复里同一块地在不同阶段的写法不同——
+    「13.693公顷」与「136929.6平方米」标准化后只差 0.4 平方米，却因不等
+    而被染成「内容变化」的黄底，逼人工逐条点开判断。按书写精度看，
+    13.693 公顷的精度是 0.001 公顷（=10 平方米），取半格即 5 平方米，
+    0.4 平方米落在这个范围内，属换算/四舍五入，不应认定为内容变化。
+
+    只对单值（非区间）生效；带「约/不超过/左右」等限定词时原值本就不精确，
+    容差再放宽一倍。区间值一律返回 None，交回原有比较逻辑。
+    """
+    if not raw:return None
+    s=re.sub(r'\s+','',raw).replace('Mpa','MPa')
+    p=rf'(?<![\d.\-])(约|不超过|不少于|不低于|不高于)?({NUM})(?:({UNIT})?[-—~～至]({NUM}))?({UNIT})(以上|以下|左右)?'
+    m=re.search(p,s)
+    if not m:return None
+    pre,a,lu,b,ru,post=m.groups()
+    if b is not None:return None
+    if ru not in FACTORS:return None
+    digits=a.split('.')[1] if '.' in a else ''
+    tol=Decimal(1).scaleb(-len(digits))*FACTORS[ru][2]/2
+    if pre or post:tol*=2
+    return tol
+
+def rounding_equivalent(items,cells):
+    """一组可比值是否只是「书写精度/约数」差异。items 与 cells 必须一一对应。
+
+    要求：同单位、同维度、都非区间、极差不超过其中最大的书写精度容差。
+    只要有一个值无法判定精度，就不宽容——宁可报差异，也不吞掉真实变化。
+    """
+    if len(items)<2:return False
+    if any(n is None for n in items):return False
+    if any(n['upper'] is not None for n in items):return False
+    if len({n['unit'] for n in items})!=1 or len({n['dimension'] for n in items})!=1:return False
+    tol=None
+    for n,c in zip(items,cells):
+        t=round_tolerance(c.get('value'))
+        if t is None:return False
+        tol=t if tol is None else max(tol,t)
+    nums=[Decimal(n['number']) for n in items]
+    spread=max(nums)-min(nums)
+    return spread>0 and spread<=tol
