@@ -110,3 +110,7 @@ docker compose up -d --build --wait
 Python标准库HTTP服务 + PyMuPDF + NumPy/Pillow + openpyxl；原生JavaScript前端，无需Node构建。可选`npm run dev`用于统一开发入口，仍启动Python服务。
 
 核心目录：`app/`解析/比对/复核与服务；`app/static/`页面；`scripts/`演示和评测；`evaluation/`虚构标注；`tests/`测试。源码仓库为 https://github.com/deyye/approval-structuring-agent 。
+
+## 简洁工作流演示
+
+运行 `python scripts/demo.py --review-demo --data /tmp/approval-workflow-demo --serve`，可体验7份虚构批文的进度总览、阶段覆盖、连续核对、冲突修订、差异筛选及按项目导出。详见 [5分钟演示](docs/DEMO.md)。

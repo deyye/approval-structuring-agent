@@ -1,1 +1,13 @@
-{"name":"approval-structuring-agent","version":"2.0.0","private":true,"scripts":{"dev":"node scripts/dev.mjs","check":"node --check app/static/app.js"}}
+{
+  "name": "approval-structuring-agent",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "check": "node --check app/static/app.js",
+    "test:ui": "node tests/test_ui.cjs"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  }
+}

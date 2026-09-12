@@ -3,6 +3,8 @@ const $ = id => document.getElementById(id);
 const state = {groups: [], key: null, kind: 'fixed', docId: '', selection: null, page: 1, stages: [], evidenceIds: new Set()};
 const labels = {same:'一致',different:'内容变化',equivalent:'表述差异',missing:'未载明',review:'待核对',align:'疑似同一指标',unextracted:'原文有线索未提取到'};
 let toastTimer;
+let latestJobs=[];
+let savingReview=false;
 // 说明每个值的来源与可信度，让复核者知道"为什么要确认"，而不是只看到一个红色状态。
 // 后端产出的每一种来源都必须在这里有解释：漏掉一种，那个值在用户眼里就是"来历不明"
 // ——大模型给的、自检循环补救的，会和规则直接抽出的一模一样，这与本系统
@@ -53,13 +55,16 @@ function node(tag, text, cls) {
 function group() { return state.groups.find(g => g.key === state.key); }
 function option(value, text) { const o = node('option', text); o.value = value; return o; }
 async function refresh() {
-  state.groups = (await api('/api/documents')).groups;
+  const [documents,jobs]=await Promise.all([api('/api/documents'),api('/api/jobs')]);
+  state.groups=documents.groups;latestJobs=jobs;
   if (!group()) state.key = state.groups[0]?.key || null;
   if (state.docId && !group()?.documents.some(d => d.id === state.docId)) state.docId = '';
   render();
 }
 function render() {
   const g = group();
+  renderSummary();
+  $('exportCurrent').disabled=!g;$('exportJson').disabled=!g;$('exportAll').disabled=!state.groups.length;
   $('docCount').textContent = state.groups.reduce((a,b) => a+b.documents.length,0) + ' 份';
   $('projects').replaceChildren();
   for (const item of state.groups) {
@@ -67,7 +72,8 @@ function render() {
     b.append(node('strong',item.name),node('small',item.documents.length+' 份批文 · '+new Set(item.documents.map(d=>d.stage)).size+' 个阶段'));
     // 项目级完成度：让用户一眼看到「还剩多少没核对完」，而不是只看单个格子的颜色。
     const rv = item.review;
-    if (rv) b.append(node('small', rv.pending === 0 ? '核对已审完' : '核对 ' + rv.label, 'progress' + (rv.pending === 0 ? ' done' : '')));
+    if (rv) b.append(node('small', rv.pending === 0 ? '待核对项已处理' : '核对 ' + rv.label, 'progress' + (rv.pending === 0 ? ' done' : '')));
+    if(rv?.stages)b.append(node('small',rv.stages.map(s=>s.name+' '+(s.count?s.count+'份':'未上传')).join(' · ')));
     b.onclick = () => {state.key=item.key;state.docId='';state.selection=null;render();resetEvidence();};
     $('projects').append(b);
   }
@@ -90,7 +96,7 @@ function render() {
   }
   thead.append(header); table.append(thead);
   const tbody=node('tbody');
-  for (const row of g.rows.filter(r=>r.kind===state.kind&&(!$('diffOnly').checked||r.status!=='same'))) {
+  for (const row of g.rows.filter(r=>r.kind===state.kind&&matchesFilter(r))) {
     const tr=node('tr'),name=node('td',row.name);
     name.append(node('span',state.docId?'单文档提取':labels[row.status],'row-note'));
     tr.append(name);
@@ -132,11 +138,13 @@ function renderReview(g) {
   box.replaceChildren();box.hidden=false;
   const head=node('div',undefined,'review-head');
   head.append(node('span','核对进度'),
-    node('span',r.pending===0?'已审完（'+r.touched+' 处人工确认）':r.status+' · '+r.label,'progress'+(r.pending===0?' done':'')));
+    node('span',r.pending===0?'待核对项已处理':r.status+' · '+r.label,'progress'+(r.pending===0?' done':'')));
   box.append(head);
   if (r.pending===0) {
-    box.append(node('p','全部待办项已处理完毕，可以导出归档。','review-empty'));
+    box.append(node('p','当前待核对项已处理。材料是否齐全请看阶段标记，导出前仍可抽查结果。','review-empty'));
   } else {
+    const start=node('button','开始 / 继续核对','primary');start.onclick=()=>nextReview();box.append(start);
+    const detail=node('details');detail.append(node('summary','查看待核对清单（'+r.pending+'项）'));
     const ul=node('ul',undefined,'review-list');
     for (const a of (r.alignments||[])) {
       const li=node('li');
@@ -170,17 +178,20 @@ function renderReview(g) {
                 node('span',it.why,'why'));
       ul.append(li);
     }
-    box.append(ul);
+    detail.append(ul);box.append(detail);
   }
   const absent=r.documents.reduce((n,d)=>n+d.absent.length,0);
   if (absent) box.append(node('p','另有 '+absent+' 个空值未检出相关线索，暂不计入待办；这不等于人工确认原文未载明，交付前请对照原文抽查。','review-note'));
 }
 function gotoItem(g,docId,it) {
-  if (state.docId!==docId) {state.docId=docId;render();}
+  state.docId=docId;
+  if(it.kind==='stage'){render();const doc=g.documents.find(d=>d.id===docId),row=g.rows.find(r=>r.name==='标题');if(doc&&row)selectCell(doc,row,row.cells[g.documents.indexOf(doc)]);else resetEvidence();$('stageSelect').focus();toast('请选择审批阶段，再点击确认阶段。');return;}
+  state.kind=it.kind;$('rowFilter').value='all';
+  $('fixedTab').setAttribute('aria-selected',String(it.kind==='fixed'));$('metricsTab').setAttribute('aria-selected',String(it.kind==='metric'));render();
   const doc=g.documents.find(d=>d.id===docId);
   const row=g.rows.find(r=>r.kind===it.kind&&r.name===it.name);
   if (!doc||!row) return;
-  selectCell(doc,row,row.cells[g.documents.indexOf(doc)],it.index);
+  selectCell(doc,row,it.kind==='metric'?doc.metrics[it.index]:row.cells[g.documents.indexOf(doc)],it.index);
 }
 // 处理「疑似同一指标」：merge 把本文件里的指标改名为对方名称（两行合并），
 // keep 只记录「确实不是同一指标」的判断。两者都会让该项目少一项待办。
@@ -201,6 +212,7 @@ function renderAgent(g) {
   const box=$('agentPanel');
   const doc=g&&state.docId?g.documents.find(d=>d.id===state.docId):null;
   const agent=doc&&doc.agent;
+  $('agentDetails').hidden=!agent;
   if (!agent) {box.hidden=true;return;}
   box.replaceChildren();box.hidden=false;
   const h=node('h4','自检循环记录');
@@ -232,15 +244,18 @@ function selectCell(doc,row,c,index=null) {
   $('evidenceStatus').textContent=['needs_review','conflict','uncertain'].includes(c.status)?'需要人工确认':c.status==='reviewed'?'人工已复核':'原文证据';
   $('humanNote').textContent=methodNote(row,c);
   $('variants').replaceChildren();$('editButton').disabled=false;
+  $('confirmNext').disabled=!c.value||!c.evidence.length||['conflict','uncertain'].includes(c.status);
+  $('confirmNext').title=$('confirmNext').disabled?'缺失、冲突或无证据时请使用修改核对':'';
   if (row.kind==='metric') {
     const matches=doc.metrics.map((m,i)=>({m,i})).filter(({m})=>m.name===row.name);
     if (matches.length>1) {
       $('editButton').disabled=index===null;
+      if(index===null)$('confirmNext').disabled=true;
       for (const {m,i} of matches) {const b=node('button','选择值：'+m.value,'source-link');b.onclick=()=>selectCell(doc,row,m,i);$('variants').append(b);}
     }
   }
   $('historyList').replaceChildren();
-  const history=(doc.history||[]).filter(h=>h.name===row.name);
+  const history=(doc.history||[]).filter(h=>h.name===row.name||h.after_name===row.name);
   if (!history.length) $('historyList').append(node('p','暂无修订记录','muted'));
   for(const h of history.slice().reverse()) {
     const value=typeof h.before==='object'?h.before.value:h.before;
@@ -269,7 +284,7 @@ function showPage(n) {
 function toBase64(file) {return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result.split(',')[1]);r.onerror=reject;r.readAsDataURL(file);});}
 async function watchJob(jid) {
   $('progress').hidden=false;let job;
-  do {job=await api('/api/jobs/'+jid);$('progress').textContent='处理中 '+job.done+' / '+job.total+' 份';if(job.status==='running')await new Promise(r=>setTimeout(r,1000));} while(job.status==='running');
+  do {job=await api('/api/jobs/'+jid);$('progress').textContent='处理中 '+job.done+' / '+job.total+' 份 · '+(job.step||'处理中')+' · '+(job.current_file||'');latestJobs=[job];renderSummary();if(job.status==='running')await new Promise(r=>setTimeout(r,1000));} while(job.status==='running');
   await refresh();$('progress').textContent='完成 '+job.results.length+' 份'+(job.errors.length?'，失败 '+job.errors.length+' 份':'');
   if(job.errors.length)toast(job.errors.map(e=>e.filename+'：'+e.message).join('；'));
   else toast('处理完成，点击结果可定位原文。');
@@ -297,28 +312,73 @@ function renderEvidencePicker() {
 }
 $('uploadButton').onclick=$('emptyUpload').onclick=()=>$('fileInput').click();$('fileInput').onchange=upload;
 $('documentSelect').onchange=()=>{state.docId=$('documentSelect').value;render();resetEvidence();};
-$('saveStage').onclick=async()=>{try{const doc=group().documents.find(d=>d.id===state.docId);await api('/api/documents/'+doc.id+'/review',{kind:'stage',name:'审批阶段',value:$('stageSelect').value,revision:doc.revision??0});await refresh();toast('审批阶段已确认。');}catch(e){toast(e.message);}};
+$('saveStage').onclick=async()=>{try{const doc=group().documents.find(d=>d.id===state.docId);await api('/api/documents/'+doc.id+'/review',{kind:'stage',name:'审批阶段',value:$('stageSelect').value,revision:doc.revision??0});await refresh();toast('审批阶段已确认。');nextReview();}catch(e){toast(e.message);}};
 $('reprocess').onclick=async()=>{const b=$('reprocess');b.disabled=true;try{const r=await api('/api/documents/'+state.docId+'/reprocess',{use_llm:$('useModel').checked});await watchJob(r.job_id);resetEvidence();}catch(e){toast(e.message);}finally{b.disabled=false;}};
 $('fixedTab').onclick=()=>{state.kind='fixed';$('fixedTab').setAttribute('aria-selected','true');$('metricsTab').setAttribute('aria-selected','false');render();};
 $('metricsTab').onclick=()=>{state.kind='metric';$('fixedTab').setAttribute('aria-selected','false');$('metricsTab').setAttribute('aria-selected','true');render();};
-$('diffOnly').onchange=render;$('prevPage').onclick=()=>showPage(state.page-1);$('nextPage').onclick=()=>showPage(state.page+1);
+$('rowFilter').onchange=render;$('prevPage').onclick=()=>showPage(state.page-1);$('nextPage').onclick=()=>showPage(state.page+1);
 $('editButton').onclick=()=>{
   if(!state.selection)return;
+  $('metricNameLabel').hidden=state.selection.row.kind!=='metric';$('metricName').value=state.selection.row.name;
   $('editLabel').textContent=state.selection.row.name;$('editValue').value=state.selection.c.value??'';$('editReason').value='';
   state.evidenceIds=new Set(state.selection.c.evidence.map(e=>e.id));$('evidencePageSelect').replaceChildren();
   state.selection.doc.pages.forEach(p=>$('evidencePageSelect').append(option(p.number,'第 '+p.number+' 页')));
   $('evidencePageSelect').value=state.page;renderEvidencePicker();$('editDialog').showModal();
 };
 $('evidencePageSelect').onchange=renderEvidencePicker;$('cancelEdit').onclick=()=>$('editDialog').close();
-$('editForm').onsubmit=async e=>{
-  e.preventDefault();const sel=state.selection;
+async function saveReview(quick=false) {
+  if(savingReview||!state.selection)return;
+  savingReview=true;$('confirmNext').disabled=true;
+  const sel=state.selection;
   try {
-    await api('/api/documents/'+sel.doc.id+'/review',{kind:sel.row.kind,name:sel.row.name,index:sel.index,value:$('editValue').value,reason:$('editReason').value,evidence_ids:[...state.evidenceIds],revision:sel.doc.revision??0});
-    $('editDialog').close();await refresh();const g=state.groups.find(g=>g.documents.some(d=>d.id===sel.doc.id));
-    state.key=g.key;render();const doc=g.documents.find(d=>d.id===sel.doc.id),row=g.rows.find(r=>r.name===sel.row.name&&r.kind===sel.row.kind);
-    selectCell(doc,row,row.cells[g.documents.indexOf(doc)]);toast('修订与证据已保存，差异已重新计算。');
-  } catch(err) {toast(err.message);}
-};
+    await api('/api/documents/'+sel.doc.id+'/review',{kind:sel.row.kind,name:sel.row.name,index:sel.index,
+      metric_name:quick?sel.row.name:$('metricName').value,
+      value:quick?sel.c.value:$('editValue').value,reason:quick?'对照原文确认无误':$('editReason').value,
+      evidence_ids:quick?sel.c.evidence.map(e=>e.id):[...state.evidenceIds],revision:sel.doc.revision??0});
+    if(!quick)$('editDialog').close();
+    await refresh();const destination=state.groups.find(g=>g.documents.some(d=>d.id===sel.doc.id));if(destination)state.key=destination.key;state.selection=null;resetEvidence();nextReview();toast('已保存，比较结果和待办已更新。');
+  } catch(err){toast(err.message);if(state.selection)selectCell(sel.doc,sel.row,sel.c,sel.index);}
+  finally{savingReview=false;}
+}
+$('editForm').onsubmit=e=>{e.preventDefault();saveReview(false);};
+$('confirmNext').onclick=()=>saveReview(true);
+function nextReview(){
+  const g=group();if(!g)return;
+  const d=g.review.documents.find(d=>d.items.length);
+  if(d){gotoItem(g,d.id,d.items[0]);return;}
+  if(g.review.alignments.length){
+    $('reviewPanel').querySelector('details').open=true;
+    $('reviewPanel').scrollIntoView({block:'nearest'});toast('请在待核对清单中处理指标名称对齐。');return;
+  }
+  state.docId='';render();resetEvidence();toast('当前项目待核对项已处理，可查看对照表并导出。');
+}
+function matchesFilter(row){
+  const filter=$('rowFilter').value;
+  if(filter==='all')return true;
+  if(filter==='review')return ['review','unextracted','align'].includes(row.status);
+  return row.status===filter;
+}
+function renderSummary(){
+  const box=$('workSummary');box.replaceChildren();
+  const total=state.groups.reduce((n,g)=>n+g.documents.length,0);
+  const pending=state.groups.reduce((n,g)=>n+(g.review?.pending||0),0);
+  box.append(node('strong','工作进展'),node('span','已入库 '+total+' 份 · '+state.groups.length+' 个项目'),node('span','待核对 '+pending+' 项'));
+  const job=latestJobs[latestJobs.length-1];
+  if(job){
+    box.append(node('span','最近批次：'+job.done+'/'+job.total+' 份已处理 · 成功 '+job.results.length+' · 失败 '+job.errors.length));
+    const bar=node('progress');bar.max=job.total||1;bar.value=job.done;bar.setAttribute('aria-label','批次处理进度');box.append(bar);
+    if(job.status==='running')box.append(node('span',(job.step||'处理中')+'：'+(job.current_file||'')));
+    if(job.errors.length){const details=node('details');details.append(node('summary','查看失败原因'));job.errors.forEach(e=>details.append(node('p',e.filename+'：'+e.message)));box.append(details);}
+  }
+  if(!total)box.append(node('p','① 上传批文 → ② 核对提示项 → ③ 查看阶段差异 → ④ 导出结果'));
+}
+function downloadExport(format,all=false){
+  const g=group();if(!all&&!g)return;
+  const a=node('a');a.href='/api/export.'+format+(all?'':'?project='+encodeURIComponent(g.key));a.download='';document.body.append(a);a.click();a.remove();
+}
+$('exportCurrent').onclick=()=>downloadExport('xlsx');
+$('exportAll').onclick=()=>downloadExport('xlsx',true);
+$('exportJson').onclick=()=>downloadExport('json');
 async function testModelConnection(vision) {
   const b=$(vision?'testVision':'testModel');b.disabled=true;
   $('modelTestResult').textContent='正在测试连接（仅发送测试内容）…';

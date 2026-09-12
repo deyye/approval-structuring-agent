@@ -74,13 +74,21 @@ def update(d,data):
             c=d['metrics'][i]
             if c['name']!=name:raise ValueError('指标名称与索引不匹配')
         else:raise ValueError('字段类型无效')
+        new_name=data.get('metric_name',name)
+        if kind=='metric' and (not isinstance(new_name,str) or not new_name.strip() or len(new_name)>80):raise ValueError('指标名称无效')
         before=copy.deepcopy(c)
         if 'evidence_ids' in data:c['evidence']=validate_evidence(d,data['evidence_ids'])
         c.update(value=value or None,status='reviewed' if value else 'missing',method='human')
         c['evidence_binding']='reviewed' if 'evidence_ids' in data else 'original'
-        if kind=='metric':c['normalized']=numeric(value)
+        if kind=='metric':
+            c['normalized']=numeric(value);c['name']=new_name.strip()
+            # Re-evaluate conflicts after a value or scope/name correction.
+            for metric in d['metrics']:
+                peers=[x for x in d['metrics'] if x['name']==metric['name'] and x.get('value')]
+                if len({x['value'] for x in peers})>1:metric['status']='conflict'
+                elif metric.get('status')=='conflict':metric['status']='reviewed' if metric.get('method')=='human' else 'needs_review'
         if kind=='fixed' and name=='项目代码':d['project_key']=value or 'unassigned:'+d['id']
         if kind=='fixed' and name=='项目名称':d['project_name']=value or d['filename']
-    d.setdefault('history',[]).append({'time':time.time(),'kind':kind,'name':name,'before':before,'after':value,'reason':reason})
+    d.setdefault('history',[]).append({'time':time.time(),'kind':kind,'name':name,'index':data.get('index'),'after_name':c.get('name') if kind=='metric' else name,'before':before,'after':value,'reason':reason})
     d['revision']=d.get('revision',0)+1
     return d

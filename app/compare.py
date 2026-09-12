@@ -59,7 +59,7 @@ def rows_for(docs):
             hits=[m for m in d['metrics'] if m['name']==name]
             if not hits:cs.append({'value':None,'status':'missing','evidence':[]})
             elif len(hits)==1:cs.append(hits[0])
-            else:cs.append({'value':'；'.join(m['value'] for m in hits),'status':'conflict','evidence':[e for m in hits for e in m['evidence']]})
+            else:cs.append({'value':'；'.join(m['value'] for m in hits),'status':'conflict' if len({m['value'] for m in hits})>1 else ('reviewed' if all(m.get('status')=='reviewed' for m in hits) else 'needs_review'),'evidence':[e for m in hits for e in m['evidence']]})
         status=compare_cells(cs);note=''
         ns=[numeric(c['value']) if c.get('value') else None for c in cs]
         available=[(i,n) for i,n in enumerate(ns) if n is not None]
@@ -94,7 +94,8 @@ def rows_for(docs):
                     notes.append(note_i)
                 note='；'.join(notes)
         rows.append({'name':name,'kind':'metric','cells':cs,'status':status,'note':note})
-    _mark_alignment(rows)
+    decided={h['name'] for d in docs for h in d.get('history',[]) if h.get('kind')=='align'}
+    _mark_alignment(rows,decided)
     return docs,rows
 
 def _rounding_note(items,raw_values=None):
@@ -113,7 +114,7 @@ def _metric_key(cell):
     if not vals:return None
     return vals[0] if len(set(vals))==1 else None
 
-def _mark_alignment(rows):
+def _mark_alignment(rows,decided=None):
     """标出「数值相同、只是名称不同、且各出现在不同文档列」的指标行。
 
     实测动机：龙泉项目可行性研究写「道路路面面积60637平方米」，初步设计写
@@ -136,6 +137,7 @@ def _mark_alignment(rows):
         for j in range(i+1,len(shaped)):
             ra,ia,ka=shaped[i];rb,ib,kb=shaped[j]
             if ka!=kb or ra['name']==rb['name']:continue
+            if '｜'.join(sorted((ra['name'],rb['name']))) in (decided or set()):continue
             if ia & ib:continue
             ra.setdefault('align_with',set()).add(rb['name'])
             rb.setdefault('align_with',set()).add(ra['name'])

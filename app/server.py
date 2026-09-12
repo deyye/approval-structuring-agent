@@ -3,7 +3,7 @@ import argparse,base64,hashlib,json,os,re,secrets,threading,time,uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse,unquote
+from urllib.parse import urlparse,unquote,parse_qs
 import fitz
 from .extract import extract,FIELDS,STAGES,numeric
 from .compare import rows_for,export_xlsx
@@ -71,8 +71,10 @@ class Store:
                 current=self.get(docid)
                 for k,old in current['fields'].items():
                     if old.get('method')=='human':fresh['fields'][k]=old
-                for old in current['metrics']:
-                    if old.get('method')=='human':fresh['metrics']=[m for m in fresh['metrics'] if m['name']!=old['name']]+[old]
+                # Keep the full reviewed metric set: renames and unresolved siblings must survive.
+                if any(h.get('kind') in ('metric','align') for h in current.get('history',[])):
+                    fresh['metrics']=current['metrics']
+                    fresh.setdefault('warnings',[]).append('建设指标已有人工作业，本次重新提取保留完整指标集合；请按需人工更新。')
                 if any(h['kind']=='stage' for h in current.get('history',[])):fresh['stage']=current['stage']
                 fresh.update(history=current.get('history',[]),revision=current.get('revision',0)+1,sha256=current.get('sha256'),created_at=current.get('created_at'))
                 fresh['project_key']=fresh['fields']['项目代码']['value'] or 'unassigned:'+docid
@@ -85,6 +87,7 @@ class Store:
     def run(self,jid,items,llm):
         job=self.jobs[jid]
         for name,blob in items:
+            job['current_file']=name;job['step']='解析与提取'
             try:
                 digest=hashlib.sha256(blob).hexdigest()
                 existing=next((d for d in self.list() if d.get('sha256')==digest),None)
@@ -94,13 +97,14 @@ class Store:
                 try:d=extract(p,name,i,llm)
                 except Exception:
                     p.unlink(missing_ok=True);raise
+                job['step']='校验与自检'
                 d=diagnose(d,p,name,i)
                 d.update(sha256=digest,created_at=time.time(),history=[],revision=0)
                 self.save(d);job['results'].append({'id':i,'filename':name})
             except Exception as e:
                 job['errors'].append({'filename':name,'message':str(e) if isinstance(e,ValueError) else '解析失败：'+type(e).__name__})
             finally:job['done']+=1
-        job['status']='completed'
+        job['status']='completed';job['step']='处理完成';job['current_file']=''
         self.prune_jobs()
 
 class Handler(BaseHTTPRequestHandler):
@@ -139,8 +143,15 @@ class Handler(BaseHTTPRequestHandler):
             jid=p.rsplit('/',1)[-1]
             if jid not in s.jobs:return self.send({'error':'任务不存在'},404)
             return self.send(s.jobs[jid])
-        if p=='/api/export.xlsx':return self.send(export_xlsx(s.list()),ctype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',download='approval-comparison.xlsx')
-        if p=='/api/export.json':return self.send(json.dumps(s.list(),ensure_ascii=False,indent=2),ctype='application/json',download='approval-evidence.json')
+        if p in ('/api/export.xlsx','/api/export.json'):
+            docs=s.list(); query=parse_qs(urlparse(self.path).query)
+            key=query.get('project',[None])[0]
+            if key is not None:
+                docs=[d for d in docs if d['project_key']==key]
+                if not docs:raise ValueError('未找到该项目，请刷新后重试')
+            if not docs:raise ValueError('请先上传批复文件')
+            if p.endswith('.xlsx'):return self.send(export_xlsx(docs),ctype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',download='approval-comparison.xlsx')
+            return self.send(json.dumps(docs,ensure_ascii=False,indent=2),ctype='application/json',download='approval-evidence.json')
         detail=re.fullmatch(r'/api/documents/([0-9a-f]{32})',p)
         if detail:return self.send(s.get(detail.group(1)))
         m=re.fullmatch(r'/api/documents/([0-9a-f]{32})/pages/(\d+)\.png',p)

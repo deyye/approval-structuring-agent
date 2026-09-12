@@ -206,8 +206,8 @@ class AlignmentTests(unittest.TestCase):
         docs, rows = rows_for(docs)
         prog = project_progress(docs, rows)
         self.assertEqual(prog['pending'], 0)
-        self.assertEqual(prog['status'], '已审完')
-        self.assertEqual(prog['label'], '已审完')
+        self.assertEqual(prog['status'], '待核对项已处理')
+        self.assertEqual(prog['label'], '待核对项已处理')
 
 
 class ExportTests(unittest.TestCase):

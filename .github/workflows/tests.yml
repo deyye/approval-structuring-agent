@@ -10,6 +10,11 @@ jobs:
           python-version: '3.12'
       - run: pip install -r requirements.lock
       - run: python -m unittest discover -s tests -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm run test:ui
       - run: sudo apt-get -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-" update && sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim
       - run: python scripts/check_ocr.py
       - run: python scripts/demo.py --data /tmp/approval-demo

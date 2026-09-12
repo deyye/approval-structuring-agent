@@ -1,21 +1,4 @@
-"""待办总览：把散落在各文档里「需要人工判断」的值收成一份可逐条确认的清单。
-
-为什么需要它：系统原本只给**单个格子**打标记（这个值已确认、那个值要核对），
-却没有「整个项目还剩多少没核对完」的总账。用的人永远不知道什么时候能收工，
-也不知道还有没有漏网的——这是「流程不直观」里最让人难受的一点。
-
-口径（与业务方确认后写进 docs/FIELD_SPEC.md）：
-1. 需要人工判断的项 = 字段状态属待核对类（needs_review / conflict / uncertain）
-   + 字段未载明但在原文检索到线索（reason=unextracted）
-   + 指标冲突或需复核
-2. 「原文未载明（reason=absent）」**不进**队列：系统已按全文线索判定原文确无
-   该要素（实测庆元三份的「印发机关」版记里确实没有独立署名行），再要求逐条
-   点击只是白耗人力。它仍可在单文档视图里查看并改成其他值。
-3. 一个人工已处理过的项不再计入：判断依据是修订历史里出现过该字段/指标，
-   而不是只看状态——因为「确认缺失」也会把状态写回 missing，
-   只认状态会让确认过的缺失反复回到队列里。
-4. 一个项目「审完」= 该项目下所有文档的待办项都为零。
-"""
+"""Current review state; material coverage is independent of review completion."""
 
 PENDING_FIELD_STATUS = ('needs_review', 'conflict', 'uncertain')
 PENDING_METRIC_STATUS = ('needs_review', 'conflict', 'uncertain')
@@ -38,25 +21,15 @@ def _why(key, method):
     return _WHY.get(key, '需人工确认')
 
 
-def _touched(doc):
-    """人工动过的字段与指标（名字集合）。修订历史是唯一依据。"""
-    names = set()
-    for h in doc.get('history', []):
-        if h.get('kind') in ('fixed', 'metric') and h.get('name'):
-            names.add((h.get('kind'), h.get('name')))
-    return names
-
-
 def _page(cell):
     return next((e['page'] for e in cell.get('evidence', []) if 'page' in e), None)
 
 
 def pending_items(doc):
     """单份文档里还需要人工处理的项。"""
-    touched = _touched(doc)
     items = []
     for name, c in doc['fields'].items():
-        if ('fixed', name) in touched or c.get('method') == 'human':
+        if c.get('method') == 'human' and c.get('status') not in PENDING_FIELD_STATUS:
             continue
         status = c.get('status')
         unextracted = status == 'missing' and c.get('reason') == 'unextracted'
@@ -68,21 +41,24 @@ def pending_items(doc):
                 'why': _why('unextracted' if unextracted else status, c.get('method')),
             })
     for i, m in enumerate(doc['metrics']):
-        if ('metric', m['name']) in touched:
-            continue
-        if m.get('status') in PENDING_METRIC_STATUS:
+        peers = [x for x in doc['metrics'] if x['name'] == m['name'] and x.get('value')]
+        conflict = len({x['value'] for x in peers}) > 1
+        if conflict or m.get('status') in PENDING_METRIC_STATUS:
             items.append({
                 'kind': 'metric', 'index': i, 'name': m['name'],
-                'value': m.get('value'), 'status': m.get('status'),
+                'value': m.get('value'), 'status': 'conflict' if conflict else m.get('status'),
                 'method': m.get('method'), 'page': _page(m),
-                'why': _why(m.get('status'), m.get('method')),
+                'why': _why('conflict' if conflict else m.get('status'), m.get('method')),
             })
+    if doc.get('stage') not in ('建议书/立项', '可行性研究', '初步设计'):
+        items.insert(0, {'kind':'stage','name':'审批阶段','index':None,'value':doc.get('stage'),
+                        'why':'请按批复标题确认审批阶段','status':'needs_review','page':1})
     return items
 
 
 def absent_items(doc):
-    """已核实「原文未载明」的空字段。不进队列，但要让用户看得见系统查过了。"""
-    return [{'name': k, 'why': '已检索全文，原文未载明该要素'}
+    """未检出线索的空字段，保留供用户抽查。"""
+    return [{'name': k, 'why': '未检出相关线索，建议抽查原文'}
             for k, c in doc['fields'].items()
             if not c.get('value') and c.get('reason') == 'absent']
 
@@ -157,10 +133,10 @@ def project_progress(docs, rows=None):
             'absent': absent_items(d),
         })
     touched = sum(1 for d in docs for h in d.get('history', [])
-                  if h.get('kind') in ('fixed', 'metric'))
+                  if h.get('kind') in ('fixed', 'metric', 'stage', 'align'))
     align = alignment_items(rows or [], docs, _align_decided(docs))
     if total == 0 and not align:
-        status = '已审完'
+        status = '待核对项已处理'
     elif touched == 0:
         status = '未开始'
     else:
@@ -169,6 +145,8 @@ def project_progress(docs, rows=None):
     return {
         'pending': pending, 'field_pending': total, 'alignment_pending': len(align),
         'touched': touched, 'status': status,
-        'label': '已审完' if pending == 0 else '还剩 %d 项待核对' % pending,
+        'label': '待核对项已处理' if pending == 0 else '还剩 %d 项待核对' % pending,
         'documents': per_doc, 'alignments': align,
+        'stages': [{'name':stage,'count':sum(d.get('stage')==stage for d in docs)}
+                   for stage in ('建议书/立项','可行性研究','初步设计')],
     }
