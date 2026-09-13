@@ -95,8 +95,14 @@ class Store:
             value=self.jobs[jid] if jid else list(self.jobs.values())
             return json.loads(json.dumps(value))
     def list(self):
+        # 只认文档文件。data/ 里还住着 model_config.json 等其它 json，
+        # 用 glob('*.json') 一网打尽会把配置当文档读进来，/api/documents
+        # 随即在取 project_key 时 KeyError，界面上只看到「请求参数无效」。
+        # 文档文件名恒为 32 位十六进制，与 get()/save() 的判据保持一致。
         with self.lock:
-            return [json.loads(p.read_text(encoding='utf-8')) for p in sorted(self.path.glob('*.json'))]
+            return [json.loads(p.read_text(encoding='utf-8'))
+                    for p in sorted(self.path.glob('*.json'))
+                    if re.fullmatch(r'[0-9a-f]{32}\.json',p.name)]
     def get(self,i):
         if not re.fullmatch(r'[0-9a-f]{32}',i):raise ValueError('文件编号无效')
         with self.lock:return json.loads((self.path/(i+'.json')).read_text(encoding='utf-8'))

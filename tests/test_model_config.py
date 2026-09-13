@@ -84,6 +84,27 @@ class ModelConfigTests(unittest.TestCase):
             settings()
         self.assertIn('中文或全角',str(err.exception))
 
+    def test_config_file_is_not_read_as_a_document(self):
+        """配置文件和文档同住在 data/ 下，不能被当成文档读进去。
+
+        实测踩过：Store.list() 用 glob('*.json') 把 model_config.json 也当文档，
+        /api/documents 随即在取 project_key 时 KeyError，界面上只看到
+        「请求参数无效」——上传后结果列表完全刷不出来。这个组合此前没被走到过：
+        测试都用临时 DATA_DIR，那里没有配置文件。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store=Store(directory)
+            (Path(directory)/'model_config.json').write_text('{"LLM_MODEL":"deepseek-flash"}',encoding='utf-8')
+            self.assertEqual(store.list(),[])
+            service=ThreadingHTTPServer(('127.0.0.1',0),Handler);service.store=store
+            worker=threading.Thread(target=service.serve_forever,daemon=True);worker.start()
+            try:
+                request=urllib.request.Request('http://127.0.0.1:%d/api/documents'%service.server_port,
+                                               headers={'X-Requested-With':'ApprovalAgent'})
+                with urllib.request.urlopen(request,timeout=10) as r:self.assertEqual(json.load(r),{'groups':[]})
+            finally:
+                service.shutdown();service.server_close();store.executor.shutdown();worker.join()
+
     def test_blank_model_name_keeps_the_panel_disabled(self):
         saved=save_config({'LLM_BASE_URL':'https://api.deepseek.com/v1',
                            'LLM_API_KEY':'sk-abcdefghijklm','LLM_MODEL':''})
