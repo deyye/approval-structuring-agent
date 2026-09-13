@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const state = {groups: [], key: null, kind: 'fixed', docId: '', selection: null, page: 1, stages: [], evidenceIds: new Set()};
+const state = {groups: [], key: null, kind: 'fixed', docId: '', selection: null, page: 1, stages: [], evidenceIds: new Set(), modelReady: false};
 const labels = {same:'一致',different:'内容变化',equivalent:'表述差异',missing:'未载明',review:'待核对',align:'疑似同一指标',unextracted:'原文有线索未提取到'};
 let toastTimer;
 let latestJobs=[];
@@ -325,11 +325,15 @@ async function watchJob(jid) {
       renderSummary();renderJobPanel();
       if(job.status==='running')await new Promise(r=>setTimeout(r,1000));
     }while(job.status==='running');
-    sessionStorage.removeItem('activeJob');await refresh();
+    await refresh();
     if(job.errors.length)toast('部分文件未完成。展开最近批次可查看原因并重新选择文件。');
     else if(job.status==='interrupted')toast('任务因服务重启中断，请查看最近批次。');
     else toast('文件处理结束，请继续核对提示项。');
+    // 释放守卫与清除 activeJob 要相邻且不可有 await：外部一旦看到 activeJob 已清，
+    // 就说明本次轮询已彻底结束，这时点「重新连接」必须能生效。
+    watchingJob=false;sessionStorage.removeItem('activeJob');
   }catch(e){
+    // 断线时保留 activeJob——它就是「重新连接」的依据；只有记录确实过期才清掉。
     if(e.status===404){sessionStorage.removeItem('activeJob');$('progress').textContent='该批次记录已过期，请刷新查看已保存结果。';}
     else{progressDisconnected=true;$('progress').textContent='进度连接中断，后台任务可能仍在继续。请重新连接，不必重复上传。';$('resumeJob').hidden=false;}
     toast(e.message);
@@ -456,13 +460,17 @@ function syncPreset(base) {
 // 界面上的模型状态只有这一个入口：勾选框、测试按钮、表单回填都由它统一驱动，
 // 避免"保存成功了但开关还灰着"这种前后端不一致。
 function applyModelConfig(config) {
-  $('useModel').disabled=!config.llm_ready;
+  state.modelReady=!!config.llm_ready;
+  // 开关不再置灰：置灰会让人以为功能坏了，其实只是还没配密钥。
+  // 允许勾选，点的时候告诉他还缺什么；上传时后端还会再校验一次，不会误用。
+  $('useModel').disabled=false;
   $('testModel').disabled=!config.llm_ready;
   $('testVision').disabled=!config.llm_ready||!config.vision_model;
   $('engineBadge').textContent=config.llm_ready?'大模型辅助已配置':'本地解析';
   $('modelHelp').textContent=config.llm_ready
     ?'当前使用 '+config.model+'；勾选后会将批文发送至该服务。'
     :(config.model_error||'配置模型后可启用。文件内容将发送至配置的服务。');
+  $('modelHelp').classList.toggle('warn',!config.llm_ready);
   $('modelBase').value=config.base_url||'';
   $('modelName').value=config.model||'';
   $('modelVision').value=config.vision_model||'';
@@ -472,6 +480,12 @@ function applyModelConfig(config) {
     :'粘贴你的 API 密钥';
   syncPreset(config.base_url||'');
 }
+$('useModel').onchange=()=>{
+  if($('useModel').checked&&!state.modelReady){
+    $('modelSaveResult').textContent='尚未配置模型：请先填写服务地址、密钥和模型名，点「保存配置」，开关会自动变可用。';
+    $('modelKey').focus();
+  }
+};
 $('modelPreset').onchange=()=>{
   const p=MODEL_PRESETS[$('modelPreset').value];
   if(!p)return;

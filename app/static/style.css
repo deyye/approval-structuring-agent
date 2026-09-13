@@ -17,7 +17,7 @@ select:focus-visible{outline:3px solid #5a9dd0;outline-offset:2px}
 @media(max-width:680px){.toolbar{flex-wrap:wrap}.toolbar>label{padding:8px 0}.document-tools label{min-width:0;width:100%}#documentSelect{min-width:0;flex:1}header .top-actions{gap:8px}.brand strong{letter-spacing:2px}}
 
 .model-tests{display:flex;flex-wrap:wrap;gap:6px}.model-tests button{font-size:12px;padding:7px 9px}#modelTestResult{overflow-wrap:anywhere;margin:8px 0}
-.model-form{display:grid;gap:7px;margin:10px 0}.model-form label{display:grid;gap:3px;font-size:12px;color:#5d6b7a}.model-form input,.model-form select{width:100%;box-sizing:border-box;padding:7px 8px;font-size:12px;font-family:inherit;border:1px solid #c9d2dc;border-radius:6px;background:#fff;color:inherit}.model-form input:focus,.model-form select:focus{outline:none;border-color:var(--blue)}.model-actions{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}.model-actions button{font-size:12px;padding:7px 9px}#modelSaveResult{overflow-wrap:anywhere;margin:6px 0;font-size:12px}
+.model-form{display:grid;gap:7px;margin:10px 0}.model-form label{display:grid;gap:3px;font-size:12px;color:#5d6b7a}.model-form input,.model-form select{width:100%;box-sizing:border-box;padding:7px 8px;font-size:12px;font-family:inherit;border:1px solid #c9d2dc;border-radius:6px;background:#fff;color:inherit}.model-form input:focus,.model-form select:focus{outline:none;border-color:var(--blue)}.model-actions{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}.model-actions button{font-size:12px;padding:7px 9px}#modelSaveResult{overflow-wrap:anywhere;margin:6px 0;font-size:12px}#modelHelp.warn{color:#a32d2d;font-weight:500}
 
 /* 新增状态：疑似同一指标（紫）、原文有线索未提取到（红） */
 .align{background:#ede7f6;color:#4a3b78}
