@@ -335,6 +335,11 @@ async function watchJob(jid) {
   }catch(e){
     // 断线时保留 activeJob——它就是「重新连接」的依据；只有记录确实过期才清掉。
     if(e.status===404){sessionStorage.removeItem('activeJob');$('progress').textContent='该批次记录已过期，请刷新查看已保存结果。';}
+    else if(job&&job.status!=='running'){
+      // 任务其实已经跑完，失败的只是收尾刷新。这时还说「后台任务可能仍在继续」
+      // 会把人引去重传文件，而实际只要刷新一下页面。
+      $('progress').textContent='任务已完成，但界面刷新失败，请手动刷新页面查看结果。';
+    }
     else{progressDisconnected=true;$('progress').textContent='进度连接中断，后台任务可能仍在继续。请重新连接，不必重复上传。';$('resumeJob').hidden=false;}
     toast(e.message);
   }finally{watchingJob=false;}
@@ -446,7 +451,7 @@ $('exportJson').onclick=()=>downloadExport('json');
 // 常见厂商预设：换厂商只需选一下，地址和模型名自动带出，密钥单独填。
 // 模型名以各账户实际可用的为准，这里只是省去手打地址的麻烦。
 const MODEL_PRESETS={
-  deepseek:{base:'https://api.deepseek.com/v1',model:'deepseek-chat'},
+  deepseek:{base:'https://api.deepseek.com/v1',model:'deepseek-flash',vision:'deepseek-flash'},
   qwen:{base:'https://dashscope.aliyuncs.com/compatible-mode/v1',model:'qwen-plus'},
   zhipu:{base:'https://open.bigmodel.cn/api/paas/v4',model:'glm-4-plus'},
   moonshot:{base:'https://api.moonshot.cn/v1',model:'moonshot-v1-8k'},
@@ -489,7 +494,8 @@ $('useModel').onchange=()=>{
 $('modelPreset').onchange=()=>{
   const p=MODEL_PRESETS[$('modelPreset').value];
   if(!p)return;
-  $('modelBase').value=p.base;$('modelName').value=p.model;
+  // 预设连带视觉模型一起填：DeepSeek 的 flash 原生支持图像输入，不必再让用户自己找。
+  $('modelBase').value=p.base;$('modelName').value=p.model;$('modelVision').value=p.vision||'';
 };
 $('saveModel').onclick=async()=>{
   const b=$('saveModel');b.disabled=true;$('modelSaveResult').textContent='正在校验并保存…';

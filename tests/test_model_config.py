@@ -65,6 +65,25 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding='utf-8'),before)
         self.assertEqual(public_config()['model'],'deepseek-chat')
 
+    def test_non_ascii_key_is_rejected_with_a_clear_message(self):
+        """密钥里混进中文时，绝不能报成「模型响应结构或 JSON 无效」。
+
+        实测踩过：中文塞不进 HTTP 头，会抛 UnicodeEncodeError，而它是 ValueError
+        的子类，被 chat() 的兜底 except 吞掉后统一报成 JSON 无效，把排查方向
+        指到模型侧，实际错在密钥本身。
+        """
+        with self.assertRaises(ModelError) as err:
+            save_config({'LLM_BASE_URL':'https://api.deepseek.com/v1','LLM_MODEL':'deepseek-chat',
+                         'LLM_API_KEY':'sk-进度连接中断，请重新连接，不必重复上传。'})
+        self.assertIn('中文或全角',str(err.exception))
+        self.assertFalse(self.path.exists(),'校验失败不能落盘')
+
+    def test_non_ascii_key_is_rejected_at_request_time_too(self):
+        os.environ['LLM_API_KEY']='sk-中文密钥-abcdefgh'
+        with self.assertRaises(ModelError) as err:
+            settings()
+        self.assertIn('中文或全角',str(err.exception))
+
     def test_blank_model_name_keeps_the_panel_disabled(self):
         saved=save_config({'LLM_BASE_URL':'https://api.deepseek.com/v1',
                            'LLM_API_KEY':'sk-abcdefghijklm','LLM_MODEL':''})

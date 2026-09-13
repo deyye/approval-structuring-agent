@@ -93,6 +93,22 @@ def _shape(base, allowed_http, timeout, retries, tokens, extra, json_mode):
     return base, parsed, timeout, retries, tokens, extra, json_mode
 
 
+def _check_key(key):
+    """密钥必须能放进 HTTP 请求头。
+
+    中文和全角标点不是合法的头字符，请求会在发出之前就抛 UnicodeEncodeError。
+    而它是 ValueError 的子类，会被下游那句 except 一并吞掉、误报成「模型响应
+    结构或 JSON 无效」——把排查方向指到模型侧，实际错在密钥本身。
+    """
+    if not key:
+        return key
+    try:
+        key.encode('latin-1')
+    except UnicodeEncodeError:
+        raise ModelError('密钥含中文或全角字符，请重新复制粘贴（常见原因是误把界面提示文字粘进了密钥框）') from None
+    return key
+
+
 def _resolve(base, allowed_http, key, key_file, allow_no_key, timeout, retries, tokens, extra, json_mode):
     """把一组原始值校验成可用的连接参数；发起请求前的最后一道关。"""
     base, parsed, timeout, retries, tokens, extra, json_mode = _shape(
@@ -104,6 +120,7 @@ def _resolve(base, allowed_http, key, key_file, allow_no_key, timeout, retries, 
             raise ModelError('无法读取模型密钥文件') from None
     if not key and not allow_no_key:
         raise ModelError('请配置 LLM_API_KEY 或 LLM_API_KEY_FILE')
+    _check_key(key)
     endpoint = base if parsed.path.endswith('/chat/completions') else base + '/chat/completions'
     return endpoint, key, timeout, retries, tokens, extra, json_mode == 'true'
 
@@ -176,6 +193,8 @@ def save_config(values, clear_key=False):
            {x.strip() for x in candidate['LLM_HTTP_HOSTS'].split(',') if x.strip()},
            candidate['LLM_TIMEOUT_SECONDS'], candidate['LLM_MAX_RETRIES'], candidate['LLM_MAX_TOKENS'],
            candidate['LLM_EXTRA_BODY'], candidate['LLM_JSON_MODE'].lower())
+    # 密钥的字符集在保存时就拦下，别等到发请求时才炸出一个看不懂的错误。
+    _check_key(candidate.get('LLM_API_KEY') or '')
     if _CONFIG_PATH is None:
         raise ModelError('当前运行方式不支持界面保存，请改 .env 后重启服务')
     _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -244,6 +263,9 @@ def chat(messages, model):
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError):
             if attempt == retries:
                 raise ModelError('模型连接失败或超时，请检查网络与服务地址') from None
+        except UnicodeEncodeError:
+            # 必须排在下面那条之前：它是 ValueError 的子类，否则会被吞成「JSON 无效」。
+            raise ModelError('密钥含中文或全角字符，请重新复制粘贴') from None
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             if isinstance(exc, ModelError):
                 raise
