@@ -1,7 +1,9 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const state = {groups: [], key: null, kind: 'fixed', docId: '', selection: null, page: 1, stages: [], evidenceIds: new Set(), modelReady: false};
+const state = {groups: [], key: null, kind: 'fixed', docId: '', selection: null, page: 1, stages: [], evidenceIds: new Set(), modelReady: false, trash: []};
 const labels = {same:'一致',different:'内容变化',equivalent:'表述差异',missing:'未载明',review:'待核对',align:'疑似同一指标',unextracted:'原文有线索未提取到'};
+// 侧栏胶囊用短名，完整阶段名放进 title——侧栏只有 230px，写全名会把三个阶段挤成两行。
+const STAGE_SHORT = {'建议书/立项':'建议书','可行性研究':'可研','初步设计':'初设'};
 let toastTimer;
 let latestJobs=[];
 let savingReview=false;
@@ -57,8 +59,8 @@ function node(tag, text, cls) {
 function group() { return state.groups.find(g => g.key === state.key); }
 function option(value, text) { const o = node('option', text); o.value = value; return o; }
 async function refresh() {
-  const [documents,jobs]=await Promise.all([api('/api/documents'),api('/api/jobs')]);
-  state.groups=documents.groups;latestJobs=jobs;
+  const [documents,jobs,trash]=await Promise.all([api('/api/documents'),api('/api/jobs'),api('/api/trash')]);
+  state.groups=documents.groups;latestJobs=jobs;state.trash=trash.items||[];
   if (!group()) state.key = state.groups[0]?.key || null;
   if (state.docId && !group()?.documents.some(d => d.id === state.docId)) state.docId = '';
   render();
@@ -68,17 +70,61 @@ function render() {
   renderSummary();renderJobPanel();
   $('exportCurrent').disabled=!g;$('exportJson').disabled=!g;$('exportAll').disabled=!state.groups.length;
   $('docCount').textContent = state.groups.reduce((a,b) => a+b.documents.length,0) + ' 份';
+  $('clearAll').disabled = !state.groups.length;
   $('projects').replaceChildren();
+  // 一个项目一个框：名称、可点的阶段胶囊、进度条三层分开，
+  // 这样「哪个项目缺哪个阶段」「还剩多少没核对」都不用去读一行挤在一起的文字。
   for (const item of state.groups) {
-    const b = node('button',undefined,'project-item'+(item.key === state.key ? ' active':''));
-    b.append(node('strong',item.name),node('small',item.documents.length+' 份批文 · '+new Set(item.documents.map(d=>d.stage)).size+' 个阶段'));
-    // 项目级完成度：让用户一眼看到「还剩多少没核对完」，而不是只看单个格子的颜色。
+    const card = node('div', undefined, 'project-item' + (item.key === state.key ? ' active':''));
+    const head = node('div', undefined, 'project-head');
+    const name = node('button', item.name, 'project-name');
+    name.title = item.name + '（' + item.documents.length + ' 份批文）';
+    name.onclick = () => {state.key=item.key;state.docId='';state.selection=null;render();resetEvidence();};
+    const remove = node('button','移出','project-delete');
+    remove.title = '把本项目的批文全部移入回收站（可恢复）';
+    remove.onclick = () => deleteProject(item);
+    head.append(name,remove);card.append(head);
+
+    const chips = node('div', undefined, 'stage-chips');
+    // 三个阶段之外还要补上实际出现的阶段（例如「待确认」）。只列固定三个阶段的话，
+    // 一个只有待确认批文的项目会三个胶囊全显示「未上传」，看着像这个项目没有文件。
+    const canonical = (item.review?.stages || []).map(s => s.name);
+    const stages = canonical
+      .concat([...new Set(item.documents.map(d => d.stage))].filter(n => !canonical.includes(n)))
+      .map(name => ({name, count: item.documents.filter(d => d.stage === name).length}));
+    for (const s of stages) {
+      const doc = item.documents.find(d => d.stage === s.name);
+      const selected = !!doc && state.docId === doc.id;
+      const chip = node('button', undefined, 'stage-chip' + (s.count ? ' filled' : '') + (selected ? ' sel' : ''));
+      chip.append(node('span', STAGE_SHORT[s.name] || s.name), node('b', s.count ? String(s.count) : '未上传'));
+      if (doc) {
+        // 点胶囊直接跳到该阶段的单文档视图；再点一次回到阶段对照。
+        chip.title = '查看 ' + s.name + ' · ' + doc.filename;
+        chip.onclick = () => {state.key=item.key;state.docId = selected ? '' : doc.id;state.selection=null;render();resetEvidence();};
+      } else {
+        chip.disabled = true;chip.title = s.name + ' 尚未上传';
+      }
+      chips.append(chip);
+    }
+    card.append(chips);
+
     const rv = item.review;
-    if (rv) b.append(node('small', rv.pending === 0 ? '待核对项已处理' : '核对 ' + rv.label, 'progress' + (rv.pending === 0 ? ' done' : '')));
-    if(rv?.stages)b.append(node('small',rv.stages.map(s=>s.name+' '+(s.count?s.count+'份':'未上传')).join(' · ')));
-    b.onclick = () => {state.key=item.key;state.docId='';state.selection=null;render();resetEvidence();};
-    $('projects').append(b);
+    if (rv) {
+      const done = Math.max(0, rv.touched || 0);
+      const total = done + (rv.pending || 0);
+      const bar = node('div', undefined, 'project-progress');
+      const fill = node('span', undefined, rv.pending === 0 ? 'done' : '');
+      fill.style.width = (total ? Math.round(done / total * 100) : (rv.pending === 0 ? 100 : 0)) + '%';
+      bar.append(fill);card.append(bar);
+      const meta = node('div', undefined, 'project-meta');
+      meta.append(node('span', item.documents.length + ' 份 · ' + new Set(item.documents.map(d=>d.stage)).size + ' 个阶段'));
+      meta.append(node('span', rv.pending === 0 ? '待核对项已处理' : '还剩 ' + rv.pending + ' 项待核对',
+        rv.pending === 0 ? 'done' : 'warn'));
+      card.append(meta);
+    }
+    $('projects').append(card);
   }
+  renderTrash();
   $('empty').hidden=!!g; $('tableWrap').hidden=!g; $('warnings').hidden=true;
   $('documentSelect').replaceChildren(option('','项目阶段对照'));
   if (!g) {resetEvidence();renderReview(null);renderAgent(null);return;}
@@ -358,6 +404,109 @@ async function upload() {
   } catch(e) {toast(e.message);$('progress').textContent='未能确认上传结果，请刷新查看最近批次后再决定是否重传。';}
   finally {$('uploadButton').disabled=false;$('emptyUpload').disabled=false;$('fileInput').value='';}
 }
+// ── 回收站与破坏性操作 ────────────────────────────────────
+// 删除一律只做「移入回收站」：人工核对结果（修订值、证据绑定、修订历史）都只存在
+// 服务端的 <id>.json 里，没有第二处可查。彻底删除是回收站里的第二个动作，且不可逆。
+function timeAgo(ts) {
+  const s = Math.max(0, Date.now()/1000 - (ts || 0));
+  if (s < 60) return '刚刚';
+  if (s < 3600) return Math.round(s/60) + ' 分钟前';
+  if (s < 86400) return Math.round(s/3600) + ' 小时前';
+  return Math.round(s/86400) + ' 天前';
+}
+function renderTrash() {
+  const list = $('trashList');list.replaceChildren();
+  $('trashCount').textContent = state.trash.length;
+  $('restoreAll').disabled = !state.trash.length;
+  $('purgeTrash').disabled = !state.trash.length;
+  if (!state.trash.length) {list.append(node('p','回收站是空的','muted'));return;}
+  for (const item of state.trash) {
+    const box = node('div', undefined, 'trash-item' + (item.intact ? '' : ' broken'));
+    const meta = node('div', undefined, 'trash-meta');
+    meta.append(node('strong', item.filename || item.id.slice(0,8)));
+    const bits = [];
+    if (item.project_name) bits.push(item.project_name);
+    if (item.stage) bits.push(item.stage);
+    if (item.revisions) bits.push('已核对 ' + item.revisions + ' 处');
+    bits.push('删除于 ' + timeAgo(item.deleted_at));
+    // 回收站里的 json 是唯一副本，缺文件要明说，不能让人以为还能恢复出完整结果。
+    if (!item.intact) bits.push('文件不完整，恢复后需重新提取');
+    meta.append(node('small', bits.join(' · ')));
+    const acts = node('div', undefined, 'trash-actions');
+    const back = node('button','恢复');back.onclick = () => restoreTrash([item.id]);
+    const gone = node('button','彻底删除','danger-ghost');gone.onclick = () => purgeTrash([item.id]);
+    acts.append(back,gone);box.append(meta,acts);list.append(box);
+  }
+}
+function confirmAction(title,text,note,okLabel) {
+  return new Promise(resolve => {
+    const dlg = $('confirmDialog');
+    $('confirmTitle').textContent = title;
+    $('confirmText').textContent = text;
+    const noteEl = $('confirmNote');noteEl.textContent = note || '';noteEl.hidden = !note;
+    const ok = $('confirmOk'), cancel = $('confirmCancel');
+    ok.textContent = okLabel || '确认';
+    const finish = value => {ok.onclick = null;cancel.onclick = null;dlg.close();resolve(value);};
+    ok.onclick = () => finish(true);
+    cancel.onclick = () => finish(false);
+    dlg.showModal();
+  });
+}
+async function deleteDocuments(ids, scope, label, extra) {
+  const r = await api('/api/documents/delete', {ids, scope, ...(extra || {})});
+  await refresh();
+  toast((label || '已移入回收站') + '：' + r.moved + ' 份。可在回收站恢复。');
+  return r;
+}
+async function deleteProject(g) {
+  const ids = g.documents.map(d => d.id);
+  const ok = await confirmAction('移出这个项目？', '「' + g.name + '」的 ' + ids.length + ' 份批文将移入回收站。',
+    '可随时从回收站恢复，人工核对结果会一并保留。','移入回收站');
+  if (!ok) return;
+  try {await deleteDocuments(ids,'project','已移出「' + g.name + '」');} catch(e) {toast(e.message);}
+}
+async function deleteSelectedDoc() {
+  const doc = group()?.documents.find(d => d.id === state.docId);
+  if (!doc) return;
+  const ok = await confirmAction('移入回收站？', doc.stage + ' · ' + doc.filename + ' 将移入回收站。',
+    '可随时从回收站恢复，人工核对结果会一并保留。','移入回收站');
+  if (!ok) return;
+  state.docId = '';
+  try {await deleteDocuments([doc.id],'document');} catch(e) {toast(e.message);}
+}
+async function clearAllDocuments() {
+  const total = state.groups.reduce((a,g) => a + g.documents.length, 0);
+  if (!total) return;
+  const ok = await confirmAction('清空全部文件？',
+    '当前 ' + state.groups.length + ' 个项目的 ' + total + ' 份批文将全部移入回收站。',
+    '移入回收站即可恢复；只有在回收站里点「彻底删除」才会真正删掉。','全部移入回收站');
+  if (!ok) return;
+  try {
+    // 口令里带着份数，服务端会核对：若确认期间又有文件传进来，它会拒绝而不是多删。
+    await deleteDocuments(state.groups.flatMap(g => g.documents.map(d => d.id)), 'all', '已清空',
+      {confirm: 'DELETE-' + total});
+  } catch(e) {
+    await refresh();toast(e.message + '（已刷新，请重试）');
+  }
+}
+async function restoreTrash(ids) {
+  try {
+    const r = await api('/api/trash/restore', {ids});
+    await refresh();toast('已恢复 ' + r.restored + ' 份。');
+  } catch(e) {toast(e.message);}
+}
+async function purgeTrash(ids) {
+  const n = ids ? ids.length : state.trash.length;
+  if (!n) return;
+  const ok = await confirmAction('彻底删除？',
+    (ids ? '选中的 ' + n + ' 份' : '回收站里的 ' + n + ' 份') + '将被永久删除，无法恢复。',
+    '人工核对结果会一起消失。如果只想让它从列表里消失，用「移入回收站」就够了。','永久删除');
+  if (!ok) return;
+  try {
+    const r = await api('/api/trash/purge', {confirm:'PURGE', ...(ids ? {ids} : {})});
+    await refresh();toast('已永久删除 ' + r.purged + ' 份。');
+  } catch(e) {toast(e.message);}
+}
 function renderEvidencePicker() {
   const doc=state.selection.doc,page=Number($('evidencePageSelect').value);$('evidencePicker').replaceChildren();
   const lines=doc.lines.filter(l=>l.page===page).map(l=>({id:l.id,text:l.text}));
@@ -369,6 +518,10 @@ function renderEvidencePicker() {
   }
 }
 $('uploadButton').onclick=$('emptyUpload').onclick=()=>$('fileInput').click();$('fileInput').onchange=upload;
+$('clearAll').onclick=clearAllDocuments;
+$('deleteDoc').onclick=deleteSelectedDoc;
+$('restoreAll').onclick=()=>restoreTrash(null);
+$('purgeTrash').onclick=()=>purgeTrash(null);
 $('documentSelect').onchange=()=>{state.docId=$('documentSelect').value;render();resetEvidence();};
 $('saveStage').onclick=async()=>{try{const doc=group().documents.find(d=>d.id===state.docId);await api('/api/documents/'+doc.id+'/review',{kind:'stage',name:'审批阶段',value:$('stageSelect').value,revision:doc.revision??0});await refresh();toast('审批阶段已确认。');nextReview();}catch(e){toast(e.message);}};
 $('reprocess').onclick=async()=>{const b=$('reprocess');b.disabled=true;try{const r=await api('/api/documents/'+state.docId+'/reprocess',{use_llm:$('useModel').checked});await watchJob(r.job_id);resetEvidence();}catch(e){toast(e.message);}finally{b.disabled=false;}};

@@ -66,3 +66,60 @@ select:focus-visible{outline:3px solid #4c7caa;outline-offset:2px}
 .toolbar select{max-width:150px}.top-actions button:disabled{cursor:not-allowed}
 
 .workflow{display:flex;list-style:none;padding:0;margin:10px 0 0;gap:8px;flex-basis:100%;flex-wrap:wrap}.workflow li{padding:7px 10px;border-radius:5px;background:#f8fafc;font-size:12px;color:#626f81}.workflow .current{background:#142e4c;color:white;font-weight:600}.work-summary>p{flex-basis:100%;margin:8px 0 0}.job-panel{margin:14px 0;padding:12px 15px;border:1px solid #e5eaf0;border-radius:8px;background:#fff}.job-panel summary{cursor:pointer;font-size:12px;line-height:1.8}.job-files{padding-left:20px;max-height:260px;overflow:auto}.job-file{font-size:12px;margin:12px 0;line-height:1.8}.job-file strong,.job-file small{display:block;overflow-wrap:anywhere}.job-file span{color:#245e98}.job-file.failed span,.job-file.interrupted span{color:#9d3b34}.job-file button{font-size:11px;padding:3px 8px;margin:6px 0}.filter-empty{padding:24px!important;color:#626f81;line-height:1.8}#resumeJob{margin-top:8px}.work-summary .workflow{width:100%}
+
+/* ── 项目卡片：一个项目一个框 ─────────────────────────────
+   原先每个项目是一个按钮、四行小字堆在一起，项目之间没有边界，阶段只能靠一行
+   文字去读。改成卡片后：项目名独占一行且可点击，阶段做成可点的胶囊（缺哪个阶段
+   一眼可见并能直接跳过去），底部一条进度条回答「还剩多少没核对」。 */
+#projects{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.project-item{display:block;padding:11px 12px;border:1px solid var(--border);border-radius:7px;background:#fbfcfe;transition:border-color .15s,background .15s,box-shadow .15s}
+.project-item:hover{border-color:#c3d3e2;background:#fff}
+.project-item.active{border-color:var(--blue);background:#fff;box-shadow:inset 3px 0 0 var(--blue)}
+.project-head{display:flex;align-items:flex-start;gap:6px;justify-content:space-between}
+.project-name{flex:1;min-width:0;min-height:0;text-align:left;border:0;background:transparent;padding:0;font-size:13px;font-weight:600;color:var(--ink);line-height:1.5;overflow-wrap:anywhere}
+.project-name:hover{background:transparent;border-color:transparent;color:var(--blue)}
+.project-item.active .project-name{color:var(--navy)}
+.project-delete{flex-shrink:0;border:1px solid transparent;background:transparent;color:#b6a8a6;padding:1px 7px;font-size:11px;min-height:0;opacity:0;transition:opacity .15s,background .15s}
+.project-item:hover .project-delete,.project-delete:focus-visible{opacity:1}
+.project-delete:hover{background:#faeeec;border-color:#f0d8d4;color:#a25449}
+.stage-chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
+.stage-chip{border:1px dashed #dbe2eb;background:#fff;color:var(--muted);font-size:11px;padding:2px 8px;border-radius:20px;min-height:0;line-height:1.7}
+.stage-chip b{font-weight:600;color:var(--ink);margin-left:5px}
+.stage-chip.filled{border-style:solid;border-color:#cfdcea;background:#eef4fa;color:#3d5f80}
+.stage-chip.filled:hover{background:#e2eef9;border-color:var(--blue);color:#245e98}
+.stage-chip.sel{border-style:solid;border-color:var(--blue);background:var(--blue);color:#fff}
+.stage-chip.sel b{color:#fff}
+.project-progress{height:4px;border-radius:2px;background:#eef1f5;overflow:hidden;margin-top:10px}
+.project-progress span{display:block;height:100%;background:var(--blue);border-radius:2px}
+.project-progress span.done{background:#4d7a68}
+.project-meta{display:flex;justify-content:space-between;gap:8px;margin-top:6px;font-size:10px;color:var(--muted)}
+.project-meta .warn{color:#896937;font-weight:600}
+.project-meta .done{color:#4d7a68;font-weight:600}
+
+/* ── 破坏性操作：统一用朱红，且一律只做「移入回收站」 ─────── */
+.danger-ghost{border-color:#f0d8d4;background:#fff;color:#a25449}
+.danger-ghost:hover{background:#faeeec;border-color:#e3bfb9;color:#8f3f35}
+.danger-ghost:disabled{opacity:.45;cursor:not-allowed}
+button.danger{background:#b4524d;border-color:#b4524d;color:#fff}
+button.danger:hover{background:#9d423d;border-color:#9d423d;color:#fff}
+.sidebar-danger{margin-top:10px}
+.sidebar-danger .danger-ghost{width:100%;font-size:11px;padding:6px 10px;min-height:0}
+#deleteDoc{margin-left:auto}
+
+/* ── 回收站 ─────────────────────────────────────────────── */
+.trash-box{margin-top:14px;border-top:1px solid var(--border);padding-top:8px;font-size:12px}
+.trash-box>summary{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)}
+.trash-box>summary span{font-weight:600;color:var(--ink)}
+.trash-list{display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:230px;overflow:auto}
+.trash-list .muted{margin:6px 0;font-size:11px}
+.trash-item{border:1px solid var(--border);border-radius:6px;padding:8px 9px;background:#fbfcfe}
+.trash-item.broken{border-color:#e3bfb9;background:#fdf7f6}
+.trash-meta strong{display:block;font-size:11px;font-weight:600;color:var(--ink);overflow-wrap:anywhere}
+.trash-meta small{display:block;margin-top:3px;font-size:10px;color:var(--muted);line-height:1.6}
+.trash-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+.trash-actions button{font-size:11px;padding:3px 8px;min-height:0;margin:0}
+
+#confirmDialog{width:min(440px,90vw)}
+#confirmDialog p{margin-top:10px;font-size:13px;line-height:1.8}
+#confirmDialog p.muted{font-size:11px;color:var(--muted)}
+

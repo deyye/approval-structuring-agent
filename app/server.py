@@ -1,5 +1,5 @@
 """Local single-user HTTP application. Bind loopback unless secured by a reverse proxy."""
-import argparse,base64,hashlib,json,os,re,secrets,threading,time,uuid
+import argparse,base64,hashlib,json,os,re,secrets,shutil,threading,time,uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
@@ -110,6 +110,109 @@ class Store:
         with self.lock:
             p=self.path/(d['id']+'.json');temp=p.with_suffix('.tmp')
             temp.write_text(json.dumps(d,ensure_ascii=False),encoding='utf-8');temp.replace(p)
+
+    # ── 回收站 ────────────────────────────────────────────────
+    # 删除不做硬删。核验场景的核心资产是人工核对结果（修订值、证据绑定、修订历史），
+    # 它们只在 <id>.json 里，删掉这份 json 就没有第二处可查。所以删除一律改成
+    # 「移入 data/.trash/<时间戳>-<id>/」，先可恢复，再由用户显式彻底删除。
+    TRASH_DIR='.trash'
+
+    def trash_root(self):
+        return self.path/self.TRASH_DIR
+
+    def list_trash(self):
+        with self.lock:
+            root=self.trash_root()
+            if not root.exists():return []
+            out=[]
+            for d in sorted(root.iterdir(),reverse=True):
+                m=re.fullmatch(r'(\d+(?:\.\d+)?)-([0-9a-f]{32})',d.name) if d.is_dir() else None
+                if not m:continue
+                at,i=float(m.group(1)),m.group(2)
+                item={'id':i,'dir':d.name,'deleted_at':at}
+                src=d/(i+'.json')
+                if src.exists():
+                    try:
+                        doc=json.loads(src.read_text(encoding='utf-8'))
+                        item.update(filename=doc.get('filename'),project_name=doc.get('project_name'),
+                                    project_key=doc.get('project_key'),stage=doc.get('stage'),
+                                    name=doc.get('fields',{}).get('项目名称',{}).get('value'),
+                                    revisions=len(doc.get('history') or []))
+                    except (OSError,ValueError):pass
+                # 回收站里的 json 是唯一副本，损坏或缺失都要显式标出，不能装作没这条。
+                item['intact']=src.exists() and (d/(i+'.pdf')).exists()
+                out.append(item)
+            return out
+
+    def trash(self,ids):
+        """把文档移入回收站。返回实际移走的编号（已在回收站或不存在的不算）。"""
+        moved=[]
+        with self.lock:
+            for i in ids:
+                if not re.fullmatch(r'[0-9a-f]{32}',i):raise ValueError('文件编号无效')
+                src=self.path/(i+'.json')
+                if not src.exists():continue
+                dest=self.trash_root()/f'{time.time():.6f}-{i}'
+                dest.mkdir(parents=True,exist_ok=True)
+                src.replace(dest/(i+'.json'))
+                pdf=self.path/(i+'.pdf')
+                if pdf.exists():pdf.replace(dest/(i+'.pdf'))
+                moved.append(i)
+            return moved
+
+    def restore(self,ids=None):
+        """把回收站里的文档放回原位。ids 为空表示全部恢复。"""
+        moved=[]
+        with self.lock:
+            root=self.trash_root()
+            if not root.exists():return moved
+            for d in sorted(root.iterdir()):
+                m=re.fullmatch(r'\d+(?:\.\d+)?-([0-9a-f]{32})',d.name) if d.is_dir() else None
+                if not m:continue
+                i=m.group(1)
+                if ids and i not in ids:continue
+                src=d/(i+'.json')
+                if not src.exists():continue
+                new_id=i
+                target=self.path/(i+'.json')
+                if target.exists():
+                    # 原编号已被占用时给恢复的这份换一个新编号。
+                    # 不能叫 <旧编号>.restored-xxxx.json：文档编号必须恒为 32 位十六进制，
+                    # 否则 Store.get() 的校验过不去，恢复出来的文件会变成谁也读不到。
+                    new_id=uuid.uuid4().hex
+                    target=self.path/(new_id+'.json')
+                    try:
+                        doc=json.loads(src.read_text(encoding='utf-8'))
+                        doc['id']=new_id
+                        target.write_text(json.dumps(doc,ensure_ascii=False),encoding='utf-8')
+                        src.unlink()
+                    except (OSError,ValueError):
+                        target.unlink(missing_ok=True);continue
+                else:
+                    src.replace(target)
+                pdf=d/(i+'.pdf')
+                if pdf.exists():pdf.replace(self.path/(new_id+'.pdf'))
+                moved.append(new_id)
+                try:d.rmdir()
+                except OSError:pass
+            return moved
+
+    def purge(self,ids=None):
+        """彻底删除。ids 为空表示清空整个回收站。只动回收站，不碰其它任何文件。"""
+        count=0
+        with self.lock:
+            root=self.trash_root()
+            if not root.exists():return 0
+            for d in sorted(root.iterdir()):
+                m=re.fullmatch(r'\d+(?:\.\d+)?-([0-9a-f]{32})',d.name) if d.is_dir() else None
+                if not m:continue
+                if ids and m.group(1) not in ids:continue
+                shutil.rmtree(d,ignore_errors=True);count+=1
+            return count
+
+    def busy(self):
+        with self.lock:return any(j.get('status')=='running' for j in self.jobs.values())
+
     def prune_jobs(self):
         """只保留最近 MAX_KEPT_JOBS 条已结束的任务，未结束的一律保留。"""
         with self.lock:
@@ -192,6 +295,7 @@ class Handler(BaseHTTPRequestHandler):
         s=self.server.store;p=urlparse(self.path).path
         if p=='/api/health':return self.send({'status':'ok','version':'2.0'})
         if p=='/api/jobs':return self.send(s.snapshot_jobs())
+        if p=='/api/trash':return self.send({'items':s.list_trash()})
         if p=='/api/config':return self.send({**public_config(),'fields':FIELDS,'stages':STAGES})
         if p=='/api/documents':
             ds=s.list();groups={}
@@ -286,6 +390,37 @@ class Handler(BaseHTTPRequestHandler):
                 d=apply_review(s.get(m.group(1)),data)
                 s.save(d)
             return self.send({'ok':True,'revision':d['revision']})
+        if p=='/api/documents/delete':
+            ids=data.get('ids')
+            if not isinstance(ids,list) or not ids:raise ValueError('请选择要移入回收站的文件')
+            if len(ids)>500:raise ValueError('一次最多处理 500 份')
+            if s.busy():raise ValueError('有文件正在处理，请等待任务结束后再删除')
+            want={i for i in ids if isinstance(i,str)}
+            if str(data.get('scope') or '')=='all':
+                # 口令里带着当前份数：既拦住误触，也挡住「界面渲染之后又有文件传进来」
+                # 导致实际清空范围与用户所见不一致。
+                # 判据是「用户点的是清空」这个意图，不是「这批 id 恰好覆盖了全部」——
+                # 后者会让「只有一个项目时删除该项目」被误判成清空。
+                docs=s.list()
+                if not docs:raise ValueError('当前没有可清空的文件')
+                expected=f'DELETE-{len(docs)}'
+                if str(data.get('confirm') or '')!=expected:raise ValueError(f'清空全部需要确认口令 {expected}')
+                if want!={d['id'] for d in docs}:raise ValueError('清空范围与当前文件不一致，请刷新后重试')
+            moved=s.trash(sorted(want))
+            if not moved:raise ValueError('未找到可移入回收站的文件，请刷新后重试')
+            return self.send({'ok':True,'moved':len(moved),'ids':moved})
+        if p=='/api/trash/restore':
+            ids=data.get('ids')
+            if ids is not None and not isinstance(ids,list):raise ValueError('恢复参数无效')
+            moved=s.restore([i for i in (ids or []) if isinstance(i,str)] or None)
+            return self.send({'ok':True,'restored':len(moved),'ids':moved})
+        if p=='/api/trash/purge':
+            # 彻底删除不可逆，所以要有独立口令，且与「移入回收站」分成两个动作。
+            if str(data.get('confirm') or '')!='PURGE':raise ValueError('彻底删除需要确认口令 PURGE')
+            ids=data.get('ids')
+            if ids is not None and not isinstance(ids,list):raise ValueError('参数无效')
+            purged=s.purge([i for i in (ids or []) if isinstance(i,str)] or None)
+            return self.send({'ok':True,'purged':purged})
         m=re.fullmatch(r'/api/documents/([0-9a-f]{32})/reprocess',p)
         if m:
             i=m.group(1);s.get(i)
