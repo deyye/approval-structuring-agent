@@ -7,7 +7,9 @@ const {spawn,execFileSync}=require('node:child_process');
 const {JSDOM}=require('jsdom');
 const root=path.resolve(__dirname,'..');
 const temp=fs.mkdtempSync(path.join(os.tmpdir(),'approval-ui-'));
-const python=process.env.PYTHON||'python';
+// 依赖装在项目自己的 venv 里，落到系统 python 会缺包；而失败提示又要靠 PYTHON=
+// 环境变量才修得了——不该让人先读文档才知道怎么跑测试。先探测 venv，找不到再退回系统 python。
+const python=process.env.PYTHON||[path.join(root,'.venv/bin/python'),path.join(root,'.venv/Scripts/python.exe')].find(p=>fs.existsSync(p))||'python';
 let server,dom;
 async function until(fn){for(let n=0;n<100;n++){if(fn())return;await new Promise(r=>setTimeout(r,50));}throw Error('UI state timeout');}
 (async()=>{
