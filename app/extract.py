@@ -11,13 +11,29 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 FIELDS = ['发文机关标志','发文字号','标题','印章','印发机关','印发日期','项目名称','项目代码','项目单位','建设内容','建设地点','总投资/匡算/估算/概算','资金来源','建设周期']
-STAGES = ['建议书/立项','可行性研究','初步设计','待确认']
+# 审批阶段。前三项是政府投资项目「建议书→可研→初设」三关；「核准/备案」是企业投资
+# 项目的另一条轨道（不经这三关），必须单列——把它归进「待确认」会把「不属于这个体系」
+# 和「判定不出来」混为一谈，而这两者的处置正好相反：前者照原样归档即可，后者必须人工介入。
+# 「待确认」固定放最后，compare.py 用 STAGES 下标排序，靠后的排在后面。
+STAGES = ['建议书/立项','可行性研究','初步设计','核准/备案','待确认']
 # 项目单位后缀：基层政府投资项目大量以"街道办事处/管委会/人民政府"为业主，
 # 另有一批以学校、法院等事业单位为业主，后缀表不全都会漏抽
 # （实测公开批复上"街道办事处"漏抽率 43%，"中学/法院"再漏 6%）。
 ORG = r'(?:公司|集团|局|委员会|办公室|街道办事处|管委会|管理委员会|人民政府|中心|医院|学校|学院|大学|研究院|银行|合作社|农场|林场|中学|小学|幼儿园|法院|检察院)'
-# 发文字号行：定位版头带与主送机关的锚点。
-DOC_NUMBER_RE = r'[\u4e00-\u9fff]{2,15}[〔\[]\d{4}[〕\]]\d+号'
+# 发文字号行：定位版头带（header_band）与主送机关（收件人）的锚点，同一行正则三处复用。
+#
+# 括号必须放宽。国标 GB/T 9704-2012 §7.2.5 要求年份用六角括号「〔〕」，但现实里
+# 至少三种变形都会出现：
+#   1) 源 PDF 文本层本身就写成半角「[]」——实测庆元一份可研批文即如此（值==原文，
+#      不是抽取改的）；
+#   2) 版头为图片层时只能靠 OCR，而实测 macOS Vision **读不出六角括号**：公文 3 号字
+#      （16pt/300dpi）下把〔2025〕读成【2025〕（左右各错一个），24pt 以上才读对，
+#      换字体还会变成［2025］或（2025）；
+#   3) 部分发布系统输出全角方头括号「【】」。
+# 旧写法只认〔[与〕]，上述形态全部失配：字段变空，且连带打坏版头带定位与项目单位锚点。
+DOC_NUMBER_OPEN = '〔\\[［【（('
+DOC_NUMBER_CLOSE = '〕\\]］】）)'
+DOC_NUMBER_RE = r'[\u4e00-\u9fff]{2,15}[%s]\d{4}[%s]\d+号' % (DOC_NUMBER_OPEN, DOC_NUMBER_CLOSE)
 # 版头带里常见的水印/系统字样；OCR 时须过滤，否则会污染标题与红头提取。
 HEADER_NOISE = ['浙江政务服务网', '投资在线平台', '投资项目在线审批监管系统', '浙江省投资项目在线审批监管平台',
                 '工程审批系统']
@@ -56,6 +72,46 @@ def clean(s): return re.sub(r'\s+', '', s or '')
 def empty(): return {'value':None, 'status':'missing', 'evidence':[], 'method':'rule'}
 def cell(value, evidence, method='rule', status='extracted'):
     return {'value':value, 'status':status, 'evidence':evidence, 'method':method}
+
+# 发文字号的规范形态 = 六角括号「〔〕」+ 半角阿拉伯数字（GB/T 9704-2012 §7.2.5）。
+# 主字段一律**留原文**：文号是要拿去和纸质件、平台数据核对的，改写原始写法会掩盖
+# 来源本身的问题（是文件写错了，还是我们认错了）。归一化值只供机器判断「是否同一文号」，
+# 放在 cell 的 normalized 键里，不进 14 项固定字段表。
+_DOC_NUMBER_FIX = {'[':'〔', '［':'〔', '【':'〔', '（':'〔', '(':'〔',
+                   ']':'〕', '］':'〕', '】':'〕', '）':'〕', ')':'〕'}
+
+def normalize_doc_number(value):
+    """把发文字号折成规范写法：括号统一为〔〕、全角数字转半角、去空白。"""
+    s = clean(value)
+    s = ''.join(_DOC_NUMBER_FIX.get(ch, ch) for ch in s)
+    return ''.join(chr(ord(ch) - 0xFEE0) if '\uff10' <= ch <= '\uff19' else ch for ch in s)
+
+def audit_doc_number(fs_cell, warnings):
+    """给发文字号补归一化值；写法不合国标时提示，但不改原文。"""
+    v = fs_cell.get('value')
+    if not v: return fs_cell
+    norm = normalize_doc_number(v)
+    fs_cell['normalized'] = norm
+    if norm != v:
+        warnings.append('发文字号「%s」的括号或数字写法不符公文格式（规范写法应为六角括号「〔〕」加半角数字），'
+                        '该形态可能来自图片层识别误差；已按原文保留，机器比对时按「%s」处理。' % (v, norm))
+    return fs_cell
+
+def classify_stage(title):
+    """按批复标题判定审批阶段。
+
+    只看标题：实测 47 份公开批复里，44 份标题恰好命中一个阶段词，零歧义零例外。
+    - 「建议书」与「立项」指同一个审批事项，只是各地措辞不同（庆元写「项目建议书的批复」，
+      龙泉写「立项申请的批复」），两者必须归到同一档，否则同一项目跨阶段对不上。
+    - 「核准/备案」是企业投资项目的另一条轨道，不经过「建议书→可研→初设」三关，
+      单列成类，不能与「待确认」混同（后者是判定不出来，必须人工介入）。
+    """
+    t = title or ''
+    if '核准' in t or '备案' in t: return '核准/备案'
+    if '初步设计' in t: return '初步设计'
+    if '可行性研究' in t: return '可行性研究'
+    if '建议书' in t or '立项' in t: return '建议书/立项'
+    return '待确认'
 
 def parse_pdf(path):
     pages, lines, warnings = [], [], []
@@ -302,6 +358,7 @@ def extract(path,name,doc_id,use_llm=False):
     for a,b,l in offsets:
         if l['page']==1 and re.fullmatch(DOC_NUMBER_RE,l['text']):
             fs['发文字号']=cell(l['text'],evidence(offsets,a,b));break
+    audit_doc_number(fs['发文字号'],warnings)
     # 版头区为图片时先做一次定向 OCR：红头与标题同在这一带，一次裁剪同时服务两个字段。
     ocr_text,ocr_method,ocr_band=ocr_header(path,pages,offsets)
     ocr_ev=[{'id':'p1-header','page':1,'bbox':list(ocr_band),'quote':ocr_text}] if (ocr_band and ocr_text) else []
@@ -338,8 +395,13 @@ def extract(path,name,doc_id,use_llm=False):
         fs['发文机关标志']=cell(None,[],'vision-required','needs_review')
         warnings.append('发文机关标志未从文本层取到，首页版头为图片层，需 OCR/视觉模型复核。')
     title=fs['标题']['value'] or ''
-    stage='初步设计' if '初步设计' in title else '可行性研究' if '可行性研究' in title else '建议书/立项' if ('建议书' in title or '立项' in title) else '待确认'
-    if '立项' in title:warnings.append('标题为立项申请批复，本次归入建议书/立项阶段，请核对事项口径。')
+    # 阶段判定只认标题关键词，规则见 classify_stage 的说明。
+    stage=classify_stage(title)
+    if '立项' in title and stage=='建议书/立项':
+        warnings.append('标题为立项申请批复，本次归入建议书/立项阶段，请核对事项口径。')
+    if stage=='核准/备案':
+        warnings.append('标题含「核准/备案」，属企业投资项目轨道（不经建议书→可研→初设三关），'
+                        '已单独归类，不参与三阶段对照。')
     if title:
         # 事项边界词：除三阶段外，企业投资项目「核准」「项目申请报告」也写在标题里，
         # 否则这类批复推不出项目名称。

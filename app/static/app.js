@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const state = {groups: [], key: null, kind: 'fixed', docId: '', selection: null, page: 1, stages: [], evidenceIds: new Set(), modelReady: false, trash: []};
 const labels = {same:'一致',different:'内容变化',equivalent:'表述差异',missing:'未载明',review:'待核对',align:'疑似同一指标',unextracted:'原文有线索未提取到'};
 // 侧栏胶囊用短名，完整阶段名放进 title——侧栏只有 230px，写全名会把三个阶段挤成两行。
-const STAGE_SHORT = {'建议书/立项':'建议书','可行性研究':'可研','初步设计':'初设'};
+const STAGE_SHORT = {'建议书/立项':'建议书','可行性研究':'可研','初步设计':'初设','核准/备案':'核准'};
 let toastTimer;
 let latestJobs=[];
 let savingReview=false;
@@ -86,11 +86,15 @@ function render() {
     head.append(name,remove);card.append(head);
 
     const chips = node('div', undefined, 'stage-chips');
-    // 三个阶段之外还要补上实际出现的阶段（例如「待确认」）。只列固定三个阶段的话，
-    // 一个只有待确认批文的项目会三个胶囊全显示「未上传」，看着像这个项目没有文件。
+    // 固定三个阶段的胶囊是用来提示「这个项目还缺哪一关」的，所以只在项目确实走
+    // 三阶段审批轨道（含有建议书/可研/初设之一的批文）时才显示这三个占位。
+    // 核准/备案类项目本来就没有这三关，给它们挂三个「未上传」等于谎报缺失。
+    // 实际出现过的阶段一律补上：只列固定三个的话，一份「待确认」批文会显示成
+    // 三个「未上传」，看着像这个项目没有文件。
+    const detected = [...new Set(item.documents.map(d => d.stage))];
     const canonical = (item.review?.stages || []).map(s => s.name);
-    const stages = canonical
-      .concat([...new Set(item.documents.map(d => d.stage))].filter(n => !canonical.includes(n)))
+    const base = detected.some(s => canonical.includes(s)) ? canonical : [];
+    const stages = base.concat(detected.filter(n => !base.includes(n)))
       .map(name => ({name, count: item.documents.filter(d => d.stage === name).length}));
     for (const s of stages) {
       const doc = item.documents.find(d => d.stage === s.name);

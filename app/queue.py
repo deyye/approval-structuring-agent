@@ -50,7 +50,9 @@ def pending_items(doc):
                 'method': m.get('method'), 'page': _page(m),
                 'why': _why('conflict' if conflict else m.get('status'), m.get('method')),
             })
-    if doc.get('stage') not in ('建议书/立项', '可行性研究', '初步设计'):
+    # 「待确认」才要人看：标题里连阶段词都没有，系统确实判不出来。
+    # 「核准/备案」是已定论的归类（标题明写核准/备案，属另一条轨道），不必再占用待办。
+    if doc.get('stage') not in ('建议书/立项', '可行性研究', '初步设计', '核准/备案'):
         items.insert(0, {'kind':'stage','name':'审批阶段','index':None,'value':doc.get('stage'),
                         'why':'请按批复标题确认审批阶段','status':'needs_review','page':1})
     return items

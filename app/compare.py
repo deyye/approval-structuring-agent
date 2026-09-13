@@ -31,7 +31,9 @@ def date_key(value):
     return tuple(map(int,m.groups())) if m else (0,0,0)
 
 def rows_for(docs):
-    docs=sorted(docs,key=lambda d:(STAGES.index(d['stage']) if d['stage'] in STAGES else 3,date_key(d['fields']['印发日期'].get('value')),d['filename']))
+    # 兜底下标取 len(STAGES)-1（=「待确认」），不写死数字：STAGES 增删阶段时
+    # 写死的 3 会悄悄变成别的阶段的位次，把未知阶段排到中间去。
+    docs=sorted(docs,key=lambda d:(STAGES.index(d['stage']) if d['stage'] in STAGES else len(STAGES)-1,date_key(d['fields']['印发日期'].get('value')),d['filename']))
     rows=[]
     for name in FIELDS:
         cs=[d['fields'][name] for d in docs]
