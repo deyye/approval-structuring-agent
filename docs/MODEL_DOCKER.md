@@ -31,6 +31,8 @@ LLM_EXTRA_BODY={}
 
 支持 OpenAI Chat Completions 兼容协议，包括支持此协议的百炼等外部服务和内网网关。基础地址应包含供应商规定的路径前缀，不能仅填首页；也可填写完整 `/chat/completions` 地址。视觉模型共用同一地址和密钥，必须支持 image_url。具体模型名、地域及权限以你的账户为准：[百炼兼容接口说明](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)。
 
+**也可以不碰这些文件**：界面左侧「模型设置」支持直接填写服务地址、密钥与模型名并保存，**改完立即生效、无需重启**，可在 DeepSeek／通义千问／智谱等任意 OpenAI 兼容服务间随时切换。界面保存的值写入 `data/model_config.json`（随数据卷持久化），**优先级高于环境变量**；点「恢复默认」即回落到本文档的配置方式。密钥只存在服务端，接口不回显明文，仅返回是否已配置及末四位。
+
 若模型不支持 response_format，设置 `LLM_JSON_MODE=false`，输出仍必须能解析为 JSON 对象。不自动放宽或绕过证据校验。需要关闭思考的供应商可按其文档配置 `LLM_EXTRA_BODY={"enable_thinking":false}`；仅允许 enable_thinking/reasoning_effort 两个附加参数。不要给不支持的模型传入这些参数。
 
 配置后重建服务使环境生效：

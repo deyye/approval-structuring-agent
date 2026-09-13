@@ -439,6 +439,68 @@ function downloadExport(format,all=false){
 $('exportCurrent').onclick=()=>downloadExport('xlsx');
 $('exportAll').onclick=()=>downloadExport('xlsx',true);
 $('exportJson').onclick=()=>downloadExport('json');
+// 常见厂商预设：换厂商只需选一下，地址和模型名自动带出，密钥单独填。
+// 模型名以各账户实际可用的为准，这里只是省去手打地址的麻烦。
+const MODEL_PRESETS={
+  deepseek:{base:'https://api.deepseek.com/v1',model:'deepseek-chat'},
+  qwen:{base:'https://dashscope.aliyuncs.com/compatible-mode/v1',model:'qwen-plus'},
+  zhipu:{base:'https://open.bigmodel.cn/api/paas/v4',model:'glm-4-plus'},
+  moonshot:{base:'https://api.moonshot.cn/v1',model:'moonshot-v1-8k'},
+  siliconflow:{base:'https://api.siliconflow.cn/v1',model:'deepseek-ai/DeepSeek-V3'},
+  openai:{base:'https://api.openai.com/v1',model:'gpt-4o-mini'}
+};
+function syncPreset(base) {
+  const hit=Object.entries(MODEL_PRESETS).find(([,p])=>p.base===base);
+  $('modelPreset').value=hit?hit[0]:'';
+}
+// 界面上的模型状态只有这一个入口：勾选框、测试按钮、表单回填都由它统一驱动，
+// 避免"保存成功了但开关还灰着"这种前后端不一致。
+function applyModelConfig(config) {
+  $('useModel').disabled=!config.llm_ready;
+  $('testModel').disabled=!config.llm_ready;
+  $('testVision').disabled=!config.llm_ready||!config.vision_model;
+  $('engineBadge').textContent=config.llm_ready?'大模型辅助已配置':'本地解析';
+  $('modelHelp').textContent=config.llm_ready
+    ?'当前使用 '+config.model+'；勾选后会将批文发送至该服务。'
+    :(config.model_error||'配置模型后可启用。文件内容将发送至配置的服务。');
+  $('modelBase').value=config.base_url||'';
+  $('modelName').value=config.model||'';
+  $('modelVision').value=config.vision_model||'';
+  $('modelKey').value='';
+  $('modelKey').placeholder=config.has_key
+    ?'已配置'+(config.key_hint?'（'+config.key_hint+'）':'')+'，留空表示不修改'
+    :'粘贴你的 API 密钥';
+  syncPreset(config.base_url||'');
+}
+$('modelPreset').onchange=()=>{
+  const p=MODEL_PRESETS[$('modelPreset').value];
+  if(!p)return;
+  $('modelBase').value=p.base;$('modelName').value=p.model;
+};
+$('saveModel').onclick=async()=>{
+  const b=$('saveModel');b.disabled=true;$('modelSaveResult').textContent='正在校验并保存…';
+  try{
+    const r=await api('/api/model/config',{values:{
+      LLM_BASE_URL:$('modelBase').value.trim(),
+      LLM_API_KEY:$('modelKey').value.trim(),
+      LLM_MODEL:$('modelName').value.trim(),
+      VISION_MODEL:$('modelVision').value.trim()
+    }});
+    applyModelConfig(r);
+    $('modelSaveResult').textContent=r.llm_ready?'已保存并生效：'+r.model:('未保存完整：'+(r.model_error||'请检查填写内容'));
+    toast(r.llm_ready?'模型配置已生效':'模型配置未完成');
+  }catch(e){$('modelSaveResult').textContent=e.message;}
+  finally{b.disabled=false;}
+};
+$('resetModel').onclick=async()=>{
+  const b=$('resetModel');b.disabled=true;
+  try{
+    const r=await api('/api/model/config/reset',{});
+    applyModelConfig(r);
+    $('modelSaveResult').textContent='已清除界面保存的配置，改用 .env / 环境变量';
+  }catch(e){$('modelSaveResult').textContent=e.message;}
+  finally{b.disabled=false;}
+};
 async function testModelConnection(vision) {
   const b=$(vision?'testVision':'testModel');b.disabled=true;
   $('modelTestResult').textContent='正在测试连接（仅发送测试内容）…';
@@ -449,10 +511,7 @@ $('testModel').onclick=()=>testModelConnection(false);$('testVision').onclick=()
 (async()=>{
   try {
     const config=await api('/api/config');state.stages=config.stages;$('stageSelect').replaceChildren(...config.stages.map(s=>option(s,s)));
-    $('useModel').disabled=!config.llm_ready;
-    $('testModel').disabled=!config.llm_ready;$('testVision').disabled=!config.llm_ready||!config.vision_model;
-    if(config.model_error)$('modelHelp').textContent=config.model_error;
-    if(config.llm_ready){$('engineBadge').textContent='大模型辅助已配置';$('modelHelp').textContent='勾选后会将批文发送至已配置的模型服务。';}
+    applyModelConfig(config);
     await refresh();const jid=latestJobs.find(j=>j.status==='running')?.id||sessionStorage.getItem('activeJob');if(jid)await watchJob(jid);
   }catch(e){toast(e.message);}
 })();

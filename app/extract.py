@@ -1,7 +1,7 @@
 """Evidence-first extraction: local rules, optional grounded LLM, no sample answers."""
 from __future__ import annotations
 from .progress import report
-from .model_client import chat, ModelError
+from .model_client import chat, effective, ModelError
 from . import vision_ocr
 import base64, copy, io, json, os, re, shutil, tempfile, urllib.request
 from decimal import Decimal
@@ -443,7 +443,7 @@ def extract(path,name,doc_id,use_llm=False):
             result=candidate
         except Exception as exc:
             result['warnings'].append('大模型抽取失败，已保留本地结果：'+(str(exc) if isinstance(exc,ModelError) else type(exc).__name__))
-    if use_llm and os.getenv('VISION_MODEL'):
+    if use_llm and effective('VISION_MODEL').strip():
         report('视觉确认', '核对印章候选图像')
         try:verify_seal(result,path)
         except Exception as exc:result['warnings'].append('印章视觉确认失败：'+(str(exc) if isinstance(exc,ModelError) else type(exc).__name__))
@@ -493,7 +493,7 @@ def augment_llm(result):
 固定字段：'''+json.dumps(FIELDS,ensure_ascii=False)
     lines=result['lines']
     if sum(len(l['text']) for l in lines)>70000:raise ValueError('文档超过单次模型输入限制')
-    out=chat([{'role':'system','content':prompt},{'role':'user','content':json.dumps([{'id':l['id'],'text':l['text']} for l in lines],ensure_ascii=False)}],os.environ.get('LLM_MODEL',''))
+    out=chat([{'role':'system','content':prompt},{'role':'user','content':json.dumps([{'id':l['id'],'text':l['text']} for l in lines],ensure_ascii=False)}],effective('LLM_MODEL'))
     byid={l['id']:l for l in lines}
     def validate(x):
         value=x.get('value');ids=x.get('evidence_ids',[])
@@ -531,5 +531,5 @@ def verify_seal(result,path):
         pix=p.get_pixmap(matrix=fitz.Matrix(2,2),clip=fitz.Rect(ev['bbox']))
     content=[{'type':'text','text':'判断图片是否包含印章图形。只返回JSON {"seal":true或false}。不鉴定印章真实性。'},
              {'type':'image_url','image_url':{'url':'data:image/png;base64,'+base64.b64encode(pix.tobytes('png')).decode()}}]
-    out=chat([{'role':'user','content':content}],os.environ['VISION_MODEL'])
+    out=chat([{'role':'user','content':content}],effective('VISION_MODEL'))
     if out.get('seal') is True:c.update(status='extracted',method='vision-model')

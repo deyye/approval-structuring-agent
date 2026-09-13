@@ -13,52 +13,186 @@ class ModelError(ValueError):
     """A user-safe error; never include provider response bodies or URLs."""
 
 
-def settings():
-    base = os.getenv('LLM_BASE_URL', '').strip().rstrip('/')
+# 界面上可保存的键。保存后立即生效，不需要重启服务：
+# settings() 每次都现读一次，而不是在启动时固化到 os.environ。
+EDITABLE = ('LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'VISION_MODEL', 'LLM_TIMEOUT_SECONDS',
+            'LLM_MAX_RETRIES', 'LLM_MAX_TOKENS', 'LLM_JSON_MODE', 'LLM_EXTRA_BODY',
+            'LLM_HTTP_HOSTS', 'LLM_ALLOW_NO_KEY')
+DEFAULTS = {'LLM_TIMEOUT_SECONDS': '90', 'LLM_MAX_RETRIES': '2', 'LLM_MAX_TOKENS': '8192',
+            'LLM_JSON_MODE': 'true', 'LLM_EXTRA_BODY': '{}', 'LLM_ALLOW_NO_KEY': 'false'}
+_CONFIG_PATH = None
+_CACHE = {'mtime': None, 'data': {}}
+
+
+def set_config_path(path):
+    """服务启动时指向实际 DATA_DIR；传 None 表示只认环境变量（独立脚本与测试用）。"""
+    global _CONFIG_PATH
+    _CONFIG_PATH = Path(path) if path is not None else None
+    _CACHE.update(mtime=None, data={})
+
+
+def runtime_config():
+    """界面保存的配置；按 mtime 缓存，避免每次请求都读盘。"""
+    path = _CONFIG_PATH
+    if path is None:
+        return {}
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        _CACHE.update(mtime=None, data={})
+        return {}
+    if _CACHE['mtime'] != mtime:
+        try:
+            loaded = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            loaded = {}
+        _CACHE.update(mtime=mtime, data=loaded if isinstance(loaded, dict) else {})
+    return _CACHE['data']
+
+
+def effective(name, default=''):
+    """键存在就用它（哪怕是空串），否则回落环境变量。
+
+    「存在即生效」是刻意设计：界面上把密钥清空后必须真的清掉，
+    而不是悄悄回落成 .env 里的旧值——否则用户会以为换了模型其实没换。
+    """
+    runtime = runtime_config()
+    value = runtime[name] if name in runtime else os.getenv(name)
+    if value is None:
+        value = default
+    return value if isinstance(value, str) else str(value)
+
+
+def _shape(base, allowed_http, timeout, retries, tokens, extra, json_mode):
+    """地址与参数的格式校验。
+
+    刻意不检查密钥是否存在：缺密钥只是「未就绪」，由 public_config 表达；
+    若在这里拦下，用户就没法先把地址和模型名存好、之后再来补密钥。
+    """
+    base = base.strip().rstrip('/')
     parsed = urlsplit(base)
-    allowed_http = {x.strip() for x in os.getenv('LLM_HTTP_HOSTS', '').split(',') if x.strip()}
     if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ModelError('模型地址无效，请填写 API 基础地址')
     if parsed.scheme != 'https' and not (parsed.scheme == 'http' and parsed.hostname in {'localhost', '127.0.0.1', '::1'} | allowed_http):
         raise ModelError('模型地址需 HTTPS；内网 HTTP 主机需明确配置 LLM_HTTP_HOSTS')
-    key = os.getenv('LLM_API_KEY', '').strip()
-    key_file = os.getenv('LLM_API_KEY_FILE', '').strip()
+    try:
+        timeout = float(timeout)
+        retries = int(retries)
+        tokens = int(tokens)
+        if not 1 <= timeout <= 300 or not 0 <= retries <= 3 or not 128 <= tokens <= 32768:
+            raise ValueError()
+        extra = json.loads(extra or '{}')
+        if not isinstance(extra, dict) or set(extra) - {'enable_thinking', 'reasoning_effort'}:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise ModelError('模型参数无效，请检查超时、重试、输出长度或附加参数') from None
+    if json_mode not in {'true', 'false'}:
+        raise ModelError('LLM_JSON_MODE 只能为 true 或 false')
+    return base, parsed, timeout, retries, tokens, extra, json_mode
+
+
+def _resolve(base, allowed_http, key, key_file, allow_no_key, timeout, retries, tokens, extra, json_mode):
+    """把一组原始值校验成可用的连接参数；发起请求前的最后一道关。"""
+    base, parsed, timeout, retries, tokens, extra, json_mode = _shape(
+        base, allowed_http, timeout, retries, tokens, extra, json_mode)
     if key_file:
         try:
             key = Path(key_file).read_text(encoding='utf-8').strip()
         except OSError:
             raise ModelError('无法读取模型密钥文件') from None
-    if not key and os.getenv('LLM_ALLOW_NO_KEY', 'false').lower() != 'true':
+    if not key and not allow_no_key:
         raise ModelError('请配置 LLM_API_KEY 或 LLM_API_KEY_FILE')
-    try:
-        timeout = float(os.getenv('LLM_TIMEOUT_SECONDS', '90'))
-        retries = int(os.getenv('LLM_MAX_RETRIES', '2'))
-        tokens = int(os.getenv('LLM_MAX_TOKENS', '8192'))
-        if not 1 <= timeout <= 300 or not 0 <= retries <= 3 or not 128 <= tokens <= 32768:
-            raise ValueError()
-        extra = json.loads((os.getenv('LLM_EXTRA_BODY') or '{}'))
-        if not isinstance(extra, dict) or set(extra) - {'enable_thinking', 'reasoning_effort'}:
-            raise ValueError()
-    except (ValueError, TypeError):
-        raise ModelError('模型参数无效，请检查超时、重试、输出长度或附加参数') from None
-    mode = os.getenv('LLM_JSON_MODE', 'true').lower()
-    if mode not in {'true', 'false'}:
-        raise ModelError('LLM_JSON_MODE 只能为 true 或 false')
     endpoint = base if parsed.path.endswith('/chat/completions') else base + '/chat/completions'
-    return endpoint, key, timeout, retries, tokens, extra, mode == 'true'
+    return endpoint, key, timeout, retries, tokens, extra, json_mode == 'true'
+
+
+def _resolve_mapping(get):
+    return _resolve(get('LLM_BASE_URL'),
+                    {x.strip() for x in get('LLM_HTTP_HOSTS').split(',') if x.strip()},
+                    get('LLM_API_KEY'),
+                    get('LLM_API_KEY_FILE'),
+                    get('LLM_ALLOW_NO_KEY', 'false').lower() == 'true',
+                    get('LLM_TIMEOUT_SECONDS', '90'),
+                    get('LLM_MAX_RETRIES', '2'),
+                    get('LLM_MAX_TOKENS', '8192'),
+                    get('LLM_EXTRA_BODY', '{}'),
+                    get('LLM_JSON_MODE', 'true').lower())
+
+
+def settings():
+    return _resolve_mapping(lambda name, default='': effective(name, default))
+
+
+def _key_hint(value):
+    """只回报「已配置」或末四位；明文永不出后端。"""
+    if not value:
+        return ''
+    return '····' + value[-4:] if len(value) >= 12 else '已配置'
 
 
 def public_config():
-    """回传就绪状态与模型名。缺哪一项就说哪一项，但不回显密钥与地址。"""
+    """对外只暴露是否就绪、模型名与密钥存在性，密钥明文不下发到浏览器。"""
+    model = effective('LLM_MODEL')
+    out = {'llm_ready': False, 'model': model, 'vision_model': effective('VISION_MODEL'),
+           'base_url': effective('LLM_BASE_URL'), 'has_key': False, 'key_hint': '',
+           'source': 'runtime' if runtime_config() else 'env', 'model_error': ''}
     try:
         settings()
-        if not os.getenv('LLM_MODEL', '').strip():
+        if not model.strip():
             raise ModelError('请配置 LLM_MODEL')
-        return {'llm_ready': True, 'model': os.getenv('LLM_MODEL'), 'vision_model': os.getenv('VISION_MODEL', ''), 'model_error': ''}
     except (ModelError, ValueError) as exc:
         reason = str(exc).strip() or '请检查服务地址、密钥和模型名'
-        return {'llm_ready': False, 'model': os.getenv('LLM_MODEL', ''), 'vision_model': os.getenv('VISION_MODEL', ''),
-                'model_error': '模型配置未完成：' + reason + '（在仓库根目录 .env 中修改后重启服务）'}
+        out['model_error'] = '模型配置未完成：' + reason + '（可在上方「模型设置」中填写保存，立即生效）'
+        return out
+    key = effective('LLM_API_KEY').strip()
+    from_file = not key and bool(effective('LLM_API_KEY_FILE').strip())
+    out['has_key'] = bool(key) or from_file or effective('LLM_ALLOW_NO_KEY', 'false').lower() == 'true'
+    out['key_hint'] = '由密钥文件提供' if from_file else _key_hint(key)
+    out['llm_ready'] = True
+    return out
+
+
+def save_config(values, clear_key=False):
+    """保存界面提交的配置；密钥留空表示保持原值，避免回填时误清空。
+
+    先校验再落盘——不合法的地址不会覆盖掉原本可用的配置。
+    """
+    current = dict(runtime_config())
+    for name in EDITABLE:
+        if name not in values:
+            continue
+        value = values[name]
+        if name == 'LLM_API_KEY' and not str(value or '').strip():
+            continue
+        if value is None:
+            continue
+        current[name] = str(value).strip()
+    if clear_key:
+        current['LLM_API_KEY'] = ''
+    candidate = {name: (current[name] if name in current else effective(name, DEFAULTS.get(name, ''))) for name in EDITABLE}
+    _shape(candidate['LLM_BASE_URL'],
+           {x.strip() for x in candidate['LLM_HTTP_HOSTS'].split(',') if x.strip()},
+           candidate['LLM_TIMEOUT_SECONDS'], candidate['LLM_MAX_RETRIES'], candidate['LLM_MAX_TOKENS'],
+           candidate['LLM_EXTRA_BODY'], candidate['LLM_JSON_MODE'].lower())
+    if _CONFIG_PATH is None:
+        raise ModelError('当前运行方式不支持界面保存，请改 .env 后重启服务')
+    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp = _CONFIG_PATH.with_suffix('.tmp')
+    temp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding='utf-8')
+    temp.replace(_CONFIG_PATH)
+    _CACHE.update(mtime=None, data={})
+    return public_config()
+
+
+def clear_config():
+    """清除界面保存的配置，回落到 .env / 环境变量。"""
+    if _CONFIG_PATH is not None:
+        try:
+            _CONFIG_PATH.unlink()
+        except OSError:
+            pass
+    _CACHE.update(mtime=None, data={})
+    return public_config()
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -118,7 +252,7 @@ def chat(messages, model):
 def probe(vision=False):
     """Use only synthetic content; never upload existing documents in diagnostics."""
     started = time.monotonic()
-    model = os.getenv('VISION_MODEL' if vision else 'LLM_MODEL', '')
+    model = effective('VISION_MODEL' if vision else 'LLM_MODEL', '')
     prompt = 'Return a JSON object with exactly this key and value: {"ok":true}.'
     content = prompt
     if vision:

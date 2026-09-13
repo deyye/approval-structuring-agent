@@ -11,7 +11,7 @@ from .review import update as apply_review
 from .queue import project_progress
 from . import agent_loop
 from .progress import observe
-from .model_client import public_config, probe, ModelError
+from .model_client import public_config, probe, save_config, clear_config, set_config_path, ModelError
 
 ROOT=Path(__file__).resolve().parent.parent
 
@@ -239,6 +239,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:self.send({'error':'处理失败，请重试'},500)
     def post(self,p,data):
         s=self.server.store
+        if p=='/api/model/config':
+            # 密钥留空表示不改动；校验在落盘前完成，非法地址不会覆盖原有可用配置。
+            return self.send(save_config(data.get('values') or {},clear_key=data.get('clear_key') is True))
+        if p=='/api/model/config/reset':
+            return self.send(clear_config())
         if p=='/api/model/test':
             if not self.server.store.model_probe_lock.acquire(blocking=False):
                 return self.send({'error':'正在测试模型连接，请稍后重试'},429)
@@ -265,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
             if sum(len(blob) for _,blob in items)>23*1024*1024:raise ValueError('每批文件总计不得超过23MB，请分批上传')
             if sum(j['status']=='running' for j in s.jobs.values())>=3:return self.send({'error':'任务繁忙，请稍后再试'},429)
             llm=bool(data.get('use_llm'))
-            if llm and not public_config()['llm_ready']:raise ValueError('请先在.env配置大模型')
+            if llm and not public_config()['llm_ready']:raise ValueError('请先在「模型设置」中完成大模型配置')
             jid=s.new_job([name for name,_ in items])
             s.executor.submit(s.run,jid,items,llm)
             return self.send({'job_id':jid},202)
@@ -279,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             i=m.group(1);s.get(i)
             llm=bool(data.get('use_llm'))
-            if llm and not public_config()['llm_ready']:raise ValueError('请先配置大模型')
+            if llm and not public_config()['llm_ready']:raise ValueError('请先在「模型设置」中完成大模型配置')
             if any(j['status']=='running' for j in s.jobs.values()):raise ValueError('请等待当前任务结束后重试')
             jid=s.new_job([s.get(i)['filename']])
             s.executor.submit(s.reprocess,jid,i,llm)
@@ -289,6 +294,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     load_env();parser=argparse.ArgumentParser();parser.add_argument('--port',type=int,default=int(os.getenv('PORT','8765')));parser.add_argument('--host',default=os.getenv('HOST','127.0.0.1'));args=parser.parse_args()
     http=ThreadingHTTPServer((args.host,args.port),Handler);http.store=Store(os.getenv('DATA_DIR',str(ROOT/'data')))
+    # 界面保存的模型配置与数据同目录：换模型不必改 .env，也不必重启。
+    set_config_path(http.store.path/'model_config.json')
     print(f'文件结构化智能体：http://{args.host}:{args.port}',flush=True)
     try:http.serve_forever()
     except KeyboardInterrupt:pass
