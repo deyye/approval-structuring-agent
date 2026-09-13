@@ -59,6 +59,8 @@ python scripts/demo.py --samples /path/to/pdfs --serve
 
 ## 模型配置
 
+模型只能通过后端 `.env` 配置，**界面不提供填写入口**（密钥留在服务端，不下发到浏览器）。配置完成后**重启服务**，界面上「使用大模型辅助抽取」才会解锁；未配置时该开关和连接测试按钮为置灰状态。
+
 复制 `.env.example` 为 `.env`，填写 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`；视觉模型另填 `VISION_MODEL`。
 
 - BASE_URL为服务根地址，程序追加`/chat/completions`；需支持messages、temperature=0及JSON object响应格式。

@@ -49,13 +49,16 @@ def settings():
 
 
 def public_config():
+    """回传就绪状态与模型名。缺哪一项就说哪一项，但不回显密钥与地址。"""
     try:
         settings()
         if not os.getenv('LLM_MODEL', '').strip():
             raise ModelError('请配置 LLM_MODEL')
         return {'llm_ready': True, 'model': os.getenv('LLM_MODEL'), 'vision_model': os.getenv('VISION_MODEL', ''), 'model_error': ''}
-    except (ModelError, ValueError):
-        return {'llm_ready': False, 'model': os.getenv('LLM_MODEL', ''), 'vision_model': os.getenv('VISION_MODEL', ''), 'model_error': '模型配置未完成，请检查服务地址、密钥和模型名。'}
+    except (ModelError, ValueError) as exc:
+        reason = str(exc).strip() or '请检查服务地址、密钥和模型名'
+        return {'llm_ready': False, 'model': os.getenv('LLM_MODEL', ''), 'vision_model': os.getenv('VISION_MODEL', ''),
+                'model_error': '模型配置未完成：' + reason + '（在仓库根目录 .env 中修改后重启服务）'}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
