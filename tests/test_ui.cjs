@@ -13,7 +13,7 @@ async function until(fn){for(let n=0;n<100;n++){if(fn())return;await new Promise
 (async()=>{
  execFileSync(python,['scripts/demo.py','--review-demo','--data',temp],{cwd:root});
  server=spawn(python,['-u','-c',"import sys;from http.server import ThreadingHTTPServer;from app.server import Handler,Store;s=ThreadingHTTPServer(('127.0.0.1',0),Handler);s.store=Store(sys.argv[1]);print(s.server_port,flush=True);s.serve_forever()",temp],{cwd:root,stdio:['ignore','pipe','pipe']});
- const port=await new Promise((resolve,reject)=>{server.stdout.once('data',b=>resolve(Number(b.toString().trim())));server.once('error',reject);server.once('exit',c=>reject(Error('server exited '+c)));});
+ const port=await new Promise((resolve,reject)=>{let buffer='';server.stdout.on('data',b=>{buffer+=b.toString();const match=buffer.match(/(?:^|\n)(\d+)\r?\n/);if(match)resolve(Number(match[1]));});server.once('error',reject);server.once('exit',c=>reject(Error('server exited '+c)));});
  const url='http://127.0.0.1:'+port;
  dom=new JSDOM(fs.readFileSync(path.join(root,'app/static/index.html'),'utf8'),{url,runScripts:'outside-only'});
  const w=dom.window,errors=[],downloads=[];
@@ -61,6 +61,32 @@ async function until(fn){for(let n=0;n<100;n++){if(fn())return;await new Promise
  const special=groups.groups.find(g=>g.documents.some(d=>d.filename==='演示待核对项目.pdf'));
  assert.ok(special.review.pending>0,'Unreviewed sibling must remain pending');
  assert.ok(special.documents[0].metrics.some(m=>m.name==='一期建筑面积'));
+ // Single-document pending filter must use this document's cells, not another stage.
+ $('fixedTab').click();$('rowFilter').value='review';$('rowFilter').dispatchEvent(new w.Event('change'));
+ const visibleButtons=[...$('tableWrap').querySelectorAll('.cell-button')];
+ assert.ok(visibleButtons.every(b=>b.closest('td').classList.contains('review')||b.closest('td').classList.contains('unextracted')));
+ // A fresh batch keeps per-file outcomes and provides result navigation.
+ const pdfPath=fs.readdirSync(temp).find(n=>n.endsWith('.pdf'));
+ const uploaded=await (await fetch(url+'/api/upload',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'ApprovalAgent'},body:JSON.stringify({files:[{name:'duplicate.pdf',data:fs.readFileSync(path.join(temp,pdfPath)).toString('base64')}]})})).json();
+ w.sessionStorage.setItem('activeJob',uploaded.job_id);$('resumeJob').click();
+ await until(()=>$('jobPanel').textContent.includes('重复 1'));
+ assert.match($('jobPanel').textContent,/重复 1/);
+ assert.match($('jobPanel').textContent,/未重复解析/);
+ $('jobPanel').querySelector('button').click();
+ assert.notEqual($('documentSelect').value,'');
+ assert.equal($('evidenceContent').hidden,true,'Changing scope must clear stale evidence');
+ assert.equal($('workSummary').querySelectorAll('.workflow li').length,4);
+ // Losing the polling connection is not reported as a failed upload.
+ await until(()=>!w.sessionStorage.getItem('activeJob'));
+ const normalFetch=w.fetch;
+ w.fetch=(p,opts)=>String(p).startsWith('/api/jobs/')?Promise.reject(Error('temporary connection loss')):normalFetch(p,opts);
+ w.sessionStorage.setItem('activeJob',uploaded.job_id);$('resumeJob').click();
+ await until(()=>$('resumeJob').hidden===false);
+ assert.match($('progress').textContent,/后台任务可能仍在继续/);
+ assert.equal(w.sessionStorage.getItem('activeJob'),uploaded.job_id);
+ w.fetch=normalFetch;$('resumeJob').click();
+ await until(()=>!w.sessionStorage.getItem('activeJob'));
+ assert.equal($('resumeJob').hidden,true);
  assert.deepEqual(errors,[]);
  console.log('UI DOM/API checks passed: summary, settings, export scope, confirm-next, filters, stage, conflict editing.');
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>{dom?.window.close();server?.kill();fs.rmSync(temp,{recursive:true,force:true});});

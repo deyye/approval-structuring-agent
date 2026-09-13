@@ -5,6 +5,8 @@ const labels = {same:'一致',different:'内容变化',equivalent:'表述差异'
 let toastTimer;
 let latestJobs=[];
 let savingReview=false;
+let watchingJob=false;
+let progressDisconnected=false;
 // 说明每个值的来源与可信度，让复核者知道"为什么要确认"，而不是只看到一个红色状态。
 // 后端产出的每一种来源都必须在这里有解释：漏掉一种，那个值在用户眼里就是"来历不明"
 // ——大模型给的、自检循环补救的，会和规则直接抽出的一模一样，这与本系统
@@ -43,7 +45,7 @@ function toast(msg) {
 async function api(path, body) {
   const response = await fetch(path, body ? {method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'ApprovalAgent'},body:JSON.stringify(body)} : {});
   const result = await response.json();
-  if (!response.ok) throw Error(result.error || '请求失败');
+  if (!response.ok) {const error=Error(result.error || '请求失败');error.status=response.status;throw error;}
   return result;
 }
 function node(tag, text, cls) {
@@ -63,7 +65,7 @@ async function refresh() {
 }
 function render() {
   const g = group();
-  renderSummary();
+  renderSummary();renderJobPanel();
   $('exportCurrent').disabled=!g;$('exportJson').disabled=!g;$('exportAll').disabled=!state.groups.length;
   $('docCount').textContent = state.groups.reduce((a,b) => a+b.documents.length,0) + ' 份';
   $('projects').replaceChildren();
@@ -96,7 +98,8 @@ function render() {
   }
   thead.append(header); table.append(thead);
   const tbody=node('tbody');
-  for (const row of g.rows.filter(r=>r.kind===state.kind&&matchesFilter(r))) {
+  const visibleRows=g.rows.filter(r=>r.kind===state.kind&&matchesFilter(r));
+  for (const row of visibleRows) {
     const tr=node('tr'),name=node('td',row.name);
     name.append(node('span',state.docId?'单文档提取':labels[row.status],'row-note'));
     tr.append(name);
@@ -119,6 +122,7 @@ function render() {
     tbody.append(tr);
     if(row.note&&!state.docId){const noteRow=node('tr'),noteCell=node('td',row.note,'comparison-note');noteCell.colSpan=indices.length+1;noteRow.append(noteCell);tbody.append(noteRow);}
   }
+  if(!visibleRows.length){const tr=node('tr'),td=node('td','当前范围没有符合筛选条件的结果。可切换基本信息 / 建设指标，或选择全部结果。','filter-empty');td.colSpan=indices.length+1;tr.append(td);tbody.append(tr);}
   table.append(tbody);$('tableWrap').replaceChildren(table);
   const warnings=g.documents.flatMap(d=>d.warnings.map(w=>d.filename+'：'+w)),counts={};
   g.documents.forEach(d=>counts[d.stage]=(counts[d.stage]||0)+1);
@@ -235,7 +239,7 @@ function renderAgent(g) {
   const left=(agent.issues||[]);
   if (left.length) box.append(node('p','仍需人工处理：'+left.map(i=>i.detail).join('；'),'why'));
 }
-function resetEvidence() {$('evidenceEmpty').hidden=false;$('evidenceContent').hidden=true;$('evidenceStatus').textContent='选择表格中的字段';}
+function resetEvidence() {state.selection=null;document.querySelectorAll('.cell-button').forEach(b=>b.setAttribute('aria-pressed','false'));$('evidenceEmpty').hidden=false;$('evidenceContent').hidden=true;$('evidenceStatus').textContent='选择表格中的字段';}
 function selectCell(doc,row,c,index=null) {
   state.selection={doc,row,c,index:index??(row.kind==='metric'?doc.metrics.findIndex(m=>m.name===row.name):null)};
   document.querySelectorAll('.cell-button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.documentId===doc.id&&b.dataset.field===row.name)));
@@ -265,6 +269,7 @@ function selectCell(doc,row,c,index=null) {
   const pages=[...new Set(c.evidence.map(e=>e.page))];
   pages.forEach(p=>{const b=node('button','第 '+p+' 页','source-link');b.onclick=()=>showPage(p);$('sourceLinks').append(b);});
   showPage(pages[0]||1);
+  if(window.matchMedia?.('(max-width:1200px)').matches)$('evidenceContent').scrollIntoView({block:'start',behavior:'smooth'});
 }
 function showPage(n) {
   const sel=state.selection;if(!sel)return;
@@ -282,22 +287,66 @@ function showPage(n) {
   $('sourceQuote').textContent=ev.length?ev.map(e=>e.quote).join(''):'本页无该字段证据。缺失信息不会从其他批文补填。';
 }
 function toBase64(file) {return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result.split(',')[1]);r.onerror=reject;r.readAsDataURL(file);});}
-async function watchJob(jid) {
-  $('progress').hidden=false;let job;
-  do {job=await api('/api/jobs/'+jid);$('progress').textContent='处理中 '+job.done+' / '+job.total+' 份 · '+(job.step||'处理中')+' · '+(job.current_file||'');latestJobs=[job];renderSummary();if(job.status==='running')await new Promise(r=>setTimeout(r,1000));} while(job.status==='running');
-  await refresh();$('progress').textContent='完成 '+job.results.length+' 份'+(job.errors.length?'，失败 '+job.errors.length+' 份':'');
-  if(job.errors.length)toast(job.errors.map(e=>e.filename+'：'+e.message).join('；'));
-  else toast('处理完成，点击结果可定位原文。');
+function selectResult(docid){
+  const g=state.groups.find(g=>g.documents.some(d=>d.id===docid));if(!g)return;
+  state.key=g.key;state.docId=docid;$('rowFilter').value='all';resetEvidence();render();
+  $('projectTitle').scrollIntoView({block:'nearest'});
 }
+function renderJobPanel(){
+  const panel=$('jobPanel'),job=latestJobs[latestJobs.length-1];
+  panel.hidden=!job;if(!job)return;
+  const opened=panel.querySelector('details')?.open;
+  panel.replaceChildren();const details=node('details');details.open=opened??job.status==='running';
+  const counts={success:0,duplicate:0,failed:0};
+  for(const file of job.files||[])if(file.status in counts)counts[file.status]++;
+  details.append(node('summary','最近批次 · '+(job.status==='running'?'处理中':job.status==='interrupted'?'已中断':'处理结束')+' · 新增/更新 '+counts.success+' · 重复 '+counts.duplicate+' · 失败 '+counts.failed));
+  const list=node('ol','', 'job-files');
+  for(const file of job.files||[]){
+    const li=node('li',undefined,'job-file '+file.status);
+    li.append(node('strong',file.filename),node('span',file.step));
+    if(file.detail)li.append(node('small',file.detail));
+    if(file.document_id){const view=node('button','查看结果');view.onclick=()=>selectResult(file.document_id);li.append(view);}
+    if(['failed','interrupted'].includes(file.status)){const retry=node('button','重新选择文件');retry.onclick=()=>$('fileInput').click();li.append(retry);}
+    list.append(li);
+  }
+  details.append(list);
+  if(job.status==='interrupted')details.append(node('p','服务曾重启。已保存的结果仍可使用，请重新选择未完成文件；重复文件会自动跳过。','muted'));
+  panel.append(details);
+}
+async function watchJob(jid) {
+  if(watchingJob)return;
+  watchingJob=true;sessionStorage.setItem('activeJob',jid);$('resumeJob').hidden=true;progressDisconnected=false;
+  $('progress').hidden=false;let job;
+  try{
+    do{
+      job=await api('/api/jobs/'+jid);
+      const i=latestJobs.findIndex(j=>j.id===jid);if(i>=0)latestJobs[i]=job;else latestJobs.push(job);
+      $('progress').textContent=(job.status==='running'?'处理中 ':'已处理 ')+job.done+' / '+job.total+' 份 · '+(job.step||'等待处理')+' · '+(job.current_file||'');
+      renderSummary();renderJobPanel();
+      if(job.status==='running')await new Promise(r=>setTimeout(r,1000));
+    }while(job.status==='running');
+    sessionStorage.removeItem('activeJob');await refresh();
+    if(job.errors.length)toast('部分文件未完成。展开最近批次可查看原因并重新选择文件。');
+    else if(job.status==='interrupted')toast('任务因服务重启中断，请查看最近批次。');
+    else toast('文件处理结束，请继续核对提示项。');
+  }catch(e){
+    if(e.status===404){sessionStorage.removeItem('activeJob');$('progress').textContent='该批次记录已过期，请刷新查看已保存结果。';}
+    else{progressDisconnected=true;$('progress').textContent='进度连接中断，后台任务可能仍在继续。请重新连接，不必重复上传。';$('resumeJob').hidden=false;}
+    toast(e.message);
+  }finally{watchingJob=false;}
+  const next=latestJobs.find(j=>j.status==='running'&&j.id!==jid);if(next&&!progressDisconnected)await watchJob(next.id);
+}
+$('resumeJob').onclick=async()=>{const jid=sessionStorage.getItem('activeJob');if(jid)await watchJob(jid);else await refresh();};
 async function upload() {
   const files=[...$('fileInput').files];if(!files.length)return;
+  if(files.some(f=>!f.name.toLowerCase().endsWith('.pdf'))){toast('请选择 PDF 文件。');return;}
   if(files.length>10||files.some(f=>f.size>20*1024*1024)||files.reduce((n,f)=>n+f.size,0)>23*1024*1024){toast('每批最多10份，单份20MB，批次总计23MB以内。');return;}
   $('uploadButton').disabled=true;$('emptyUpload').disabled=true;$('progress').hidden=false;$('progress').textContent='正在读取文件…';
   try {
     const payload=[];for(const f of files)payload.push({name:f.name,data:await toBase64(f)});
     const r=await api('/api/upload',{files:payload,use_llm:$('useModel').checked});
-    sessionStorage.setItem('activeJob',r.job_id);await watchJob(r.job_id);sessionStorage.removeItem('activeJob');
-  } catch(e) {toast(e.message);$('progress').textContent='上传未完成，请重试。';}
+    await watchJob(r.job_id);
+  } catch(e) {toast(e.message);$('progress').textContent='未能确认上传结果，请刷新查看最近批次后再决定是否重传。';}
   finally {$('uploadButton').disabled=false;$('emptyUpload').disabled=false;$('fileInput').value='';}
 }
 function renderEvidencePicker() {
@@ -355,7 +404,11 @@ function nextReview(){
 function matchesFilter(row){
   const filter=$('rowFilter').value;
   if(filter==='all')return true;
-  if(filter==='review')return ['review','unextracted','align'].includes(row.status);
+  if(filter==='review'){
+    const g=group();const index=state.docId?g.documents.findIndex(d=>d.id===state.docId):-1;
+    const cells=index<0?row.cells:[row.cells[index]];
+    return (!state.docId&&row.status==='align')||cells.some(c=>c&&(['needs_review','conflict','uncertain'].includes(c.status)||(c.status==='missing'&&c.reason==='unextracted')));
+  }
   return row.status===filter;
 }
 function renderSummary(){
@@ -363,14 +416,21 @@ function renderSummary(){
   const total=state.groups.reduce((n,g)=>n+g.documents.length,0);
   const pending=state.groups.reduce((n,g)=>n+(g.review?.pending||0),0);
   box.append(node('strong','工作进展'),node('span','已入库 '+total+' 份 · '+state.groups.length+' 个项目'),node('span','待核对 '+pending+' 项'));
-  const job=latestJobs[latestJobs.length-1];
+  const job=latestJobs.find(j=>j.status==='running')||latestJobs[latestJobs.length-1];
+  const g=group();
+  const flow=node('ol',undefined,'workflow');
+  const labels=['上传批文','自动处理','核对提示','查看差异 / 导出'];
+  const active=!total?0:g?.review?.pending?2:3;
+  labels.forEach((label,index)=>{const li=node('li',(index+1)+' '+label,index===(job?.status==='running'?1:active)?'current':'');if(li.className)li.setAttribute('aria-current','step');flow.append(li);});
+  box.append(flow);
   if(job){
-    box.append(node('span','最近批次：'+job.done+'/'+job.total+' 份已处理 · 成功 '+job.results.length+' · 失败 '+job.errors.length));
+    box.append(node('span','最近批次：'+job.done+'/'+job.total+' 份已处理 · 新增/更新 '+job.results.filter(r=>!r.duplicate).length+' · 重复 '+job.results.filter(r=>r.duplicate).length+' · 失败 '+job.errors.length));
     const bar=node('progress');bar.max=job.total||1;bar.value=job.done;bar.setAttribute('aria-label','批次处理进度');box.append(bar);
     if(job.status==='running')box.append(node('span',(job.step||'处理中')+'：'+(job.current_file||'')));
     if(job.errors.length){const details=node('details');details.append(node('summary','查看失败原因'));job.errors.forEach(e=>details.append(node('p',e.filename+'：'+e.message)));box.append(details);}
   }
-  if(!total)box.append(node('p','① 上传批文 → ② 核对提示项 → ③ 查看阶段差异 → ④ 导出结果'));
+  if(!total)box.append(node('p','先上传同一项目的批复；无需配置模型也可开始。'));
+  else if(g)box.append(node('p',g.review?.pending?'下一步：点击“开始 / 继续核对”，按原文逐项确认。':'下一步：查看阶段差异并导出。待办清零不代表所有审批材料已齐全。'));
 }
 function downloadExport(format,all=false){
   const g=group();if(!all&&!g)return;
@@ -393,6 +453,6 @@ $('testModel').onclick=()=>testModelConnection(false);$('testVision').onclick=()
     $('testModel').disabled=!config.llm_ready;$('testVision').disabled=!config.llm_ready||!config.vision_model;
     if(config.model_error)$('modelHelp').textContent=config.model_error;
     if(config.llm_ready){$('engineBadge').textContent='大模型辅助已配置';$('modelHelp').textContent='勾选后会将批文发送至已配置的模型服务。';}
-    await refresh();const jid=sessionStorage.getItem('activeJob');if(jid){await watchJob(jid);sessionStorage.removeItem('activeJob');}
+    await refresh();const jid=latestJobs.find(j=>j.status==='running')?.id||sessionStorage.getItem('activeJob');if(jid)await watchJob(jid);
   }catch(e){toast(e.message);}
 })();

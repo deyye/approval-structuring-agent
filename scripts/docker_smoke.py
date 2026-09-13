@@ -22,7 +22,10 @@ def call(path,data=None):
 assert json.loads(call('/api/health'))['status']=='ok'
 assert '批文研析' in call('/').decode()
 if a.verify_persistence:
-    docid=json.loads(Path(a.state).read_text())['id']
+    saved=json.loads(Path(a.state).read_text());docid=saved['id']
+    restored=json.loads(call('/api/jobs/'+saved['job_id']))
+    assert restored['status']=='completed'
+    assert restored['files'][0]['status']=='success'
 else:
     with fitz.open() as pdf:
         page=pdf.new_page();page.insert_text((50,70),'Synthetic Docker acceptance document')
@@ -37,7 +40,7 @@ else:
     assert not result['errors'],result['errors']
     docid=result['results'][0]['id']
     call('/api/documents/'+docid+'/review',{'kind':'fixed','name':'项目名称','value':'虚构容器验收项目'})
-    Path(a.state).write_text(json.dumps({'id':docid}))
+    Path(a.state).write_text(json.dumps({'id':docid,'job_id':job['job_id']}))
 assert json.loads(call('/api/documents/'+docid))['fields']['项目名称']['value']=='虚构容器验收项目'
 assert call('/api/documents/'+docid+'/pages/1.png').startswith(b'\x89PNG')
 workbook=load_workbook(io.BytesIO(call('/api/export.xlsx')))

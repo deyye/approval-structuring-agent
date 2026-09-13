@@ -9,3 +9,5 @@ data/
 evaluation/results/
 secrets/
 backups/
+
+node_modules/

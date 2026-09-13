@@ -10,6 +10,7 @@ from .compare import rows_for,export_xlsx
 from .review import update as apply_review
 from .queue import project_progress
 from . import agent_loop
+from .progress import observe
 from .model_client import public_config, probe, ModelError
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -44,6 +45,55 @@ class Store:
     def __init__(self,path):
         self.path=Path(path);self.path.mkdir(parents=True,exist_ok=True)
         self.lock=threading.RLock();self.model_probe_lock=threading.Lock();self.jobs={};self.executor=ThreadPoolExecutor(max_workers=1)
+        self.job_path=self.path/"jobs"/"state.json"
+        if self.job_path.exists():
+            try:self.jobs=json.loads(self.job_path.read_text(encoding="utf-8"))
+            except (OSError,ValueError):self.jobs={}
+            for job in self.jobs.values():
+                if job.get("status")=="running":
+                    job.update(status="interrupted",step="服务重启，任务已中断",current_file="")
+                    job["done"]=sum(f["status"] in ("success","duplicate","failed") for f in job.get("files",[]))
+                    for item in job.get("files",[]):
+                        if item["status"] in ("queued","running"):item.update(status="interrupted",step="请重新上传该文件",detail="已保存的文件和人工修订仍保留")
+            self.persist_jobs()
+    def persist_jobs(self):
+        with self.lock:
+            self.job_path.parent.mkdir(exist_ok=True)
+            temp=self.job_path.with_suffix('.tmp')
+            temp.write_text(json.dumps(self.jobs,ensure_ascii=False),encoding='utf-8')
+            temp.replace(self.job_path)
+    def new_job(self,names):
+        with self.lock:
+            jid=uuid.uuid4().hex
+            self.jobs[jid]={'id':jid,'status':'running','step':'等待处理','total':len(names),'done':0,
+                'created_at':time.time(),'updated_at':time.time(),'results':[],'errors':[],
+                'files':[{'filename':n,'status':'queued','step':'等待处理','detail':''} for n in names]}
+            self.prune_jobs();self.persist_jobs()
+            return jid
+    def progress(self,job,index,step,detail=''):
+        with self.lock:
+            job.update(step=step,updated_at=time.time())
+            if job.get('files'):
+                item=job['files'][index];item.update(step=step,detail=detail,status='running')
+                job['current_file']=item['filename']
+            # Persist at file boundaries, not every OCR page.
+    def extract_job(self,job,index,path,name,docid,llm):
+        with observe(lambda step,detail:self.progress(job,index,step,detail)):
+            result=extract(path,name,docid,llm)
+        self.progress(job,index,'校验与自检','核验原文证据，必要时定点重读')
+        result=diagnose(result,path,name,docid)
+        self.progress(job,index,'保存结果','保存后即可查看原文并人工核对')
+        return result
+    def finish_file(self,job,index,status,detail='',docid=None):
+        with self.lock:
+            if job.get('files'):
+                job['files'][index].update(status=status,step={'success':'处理完成','duplicate':'已存在，未重复解析','failed':'处理失败'}[status],detail=detail,document_id=docid)
+            job['updated_at']=time.time()
+            self.persist_jobs()
+    def snapshot_jobs(self,jid=None):
+        with self.lock:
+            value=self.jobs[jid] if jid else list(self.jobs.values())
+            return json.loads(json.dumps(value))
     def list(self):
         with self.lock:
             return [json.loads(p.read_text(encoding='utf-8')) for p in sorted(self.path.glob('*.json'))]
@@ -66,7 +116,8 @@ class Store:
         try:
             original=self.get(docid)
             pdf=self.path/(docid+'.pdf')
-            fresh=diagnose(extract(pdf,original['filename'],docid,llm),pdf,original['filename'],docid)
+            self.progress(job,0,'读取页面','开始重新提取，保留人工修订')
+            fresh=self.extract_job(job,0,pdf,original['filename'],docid,llm)
             with self.lock:
                 current=self.get(docid)
                 for k,old in current['fields'].items():
@@ -81,31 +132,39 @@ class Store:
                 fresh['project_name']=fresh['fields']['项目名称']['value'] or fresh['filename']
                 self.save(fresh)
             job['results'].append({'id':docid,'filename':fresh['filename']})
-        except Exception as exc:job['errors'].append({'filename':docid,'message':'重新提取失败：'+type(exc).__name__})
-        finally:job.update(done=1,status='completed')
+            self.finish_file(job,0,'success','人工修订已保留',docid)
+        except Exception as exc:
+            message='重新提取失败，请检查 PDF 或重试：'+type(exc).__name__
+            job['errors'].append({'filename':docid,'message':message})
+            self.finish_file(job,0,'failed',message)
+        finally:
+            job.update(done=1,status='completed',current_file='',step='处理结束');self.persist_jobs()
 
     def run(self,jid,items,llm):
         job=self.jobs[jid]
-        for name,blob in items:
-            job['current_file']=name;job['step']='解析与提取'
+        known={d.get('sha256'):d for d in self.list() if d.get('sha256')}
+        for index,(name,blob) in enumerate(items):
+            self.progress(job,index,'检查文件','检查是否已上传')
             try:
                 digest=hashlib.sha256(blob).hexdigest()
-                existing=next((d for d in self.list() if d.get('sha256')==digest),None)
+                existing=known.get(digest)
                 if existing:
-                    job['results'].append({'id':existing['id'],'filename':name,'duplicate':True});continue
+                    job['results'].append({'id':existing['id'],'filename':name,'duplicate':True})
+                    self.finish_file(job,index,'duplicate','如需更新，请在单文档视图选择重新提取',existing['id']);continue
                 i=uuid.uuid4().hex;p=self.path/(i+'.pdf');p.write_bytes(blob)
-                try:d=extract(p,name,i,llm)
+                try:d=self.extract_job(job,index,p,name,i,llm)
                 except Exception:
                     p.unlink(missing_ok=True);raise
-                job['step']='校验与自检'
-                d=diagnose(d,p,name,i)
                 d.update(sha256=digest,created_at=time.time(),history=[],revision=0)
-                self.save(d);job['results'].append({'id':i,'filename':name})
+                self.save(d);known[digest]=d;job['results'].append({'id':i,'filename':name})
+                self.finish_file(job,index,'success','请核对系统提示项后查看阶段差异',i)
             except Exception as e:
-                job['errors'].append({'filename':name,'message':str(e) if isinstance(e,ValueError) else '解析失败：'+type(e).__name__})
+                message=str(e) if isinstance(e,ValueError) else '无法解析 PDF，请确认文件能正常打开后重新上传'
+                job['errors'].append({'filename':name,'message':message})
+                self.finish_file(job,index,'failed',message)
             finally:job['done']+=1
         job['status']='completed';job['step']='处理完成';job['current_file']=''
-        self.prune_jobs()
+        self.prune_jobs();self.persist_jobs()
 
 class Handler(BaseHTTPRequestHandler):
     server_version='ApprovalAgent/1.0'
@@ -126,7 +185,7 @@ class Handler(BaseHTTPRequestHandler):
     def get(self):
         s=self.server.store;p=urlparse(self.path).path
         if p=='/api/health':return self.send({'status':'ok','version':'2.0'})
-        if p=='/api/jobs':return self.send(list(s.jobs.values()))
+        if p=='/api/jobs':return self.send(s.snapshot_jobs())
         if p=='/api/config':return self.send({**public_config(),'fields':FIELDS,'stages':STAGES})
         if p=='/api/documents':
             ds=s.list();groups={}
@@ -142,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
         if p.startswith('/api/jobs/'):
             jid=p.rsplit('/',1)[-1]
             if jid not in s.jobs:return self.send({'error':'任务不存在'},404)
-            return self.send(s.jobs[jid])
+            return self.send(s.snapshot_jobs(jid))
         if p in ('/api/export.xlsx','/api/export.json'):
             docs=s.list(); query=parse_qs(urlparse(self.path).query)
             key=query.get('project',[None])[0]
@@ -203,11 +262,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not name.lower().endswith('.pdf') or not blob.startswith(b'%PDF-'):raise ValueError('仅支持PDF文件')
                 if len(blob)>20*1024*1024:raise ValueError('单份文件不得超过20MB')
                 items.append((name,blob))
+            if sum(len(blob) for _,blob in items)>23*1024*1024:raise ValueError('每批文件总计不得超过23MB，请分批上传')
             if sum(j['status']=='running' for j in s.jobs.values())>=3:return self.send({'error':'任务繁忙，请稍后再试'},429)
             llm=bool(data.get('use_llm'))
             if llm and not public_config()['llm_ready']:raise ValueError('请先在.env配置大模型')
-            jid=uuid.uuid4().hex
-            s.jobs[jid]={'id':jid,'status':'running','total':len(items),'done':0,'results':[],'errors':[]}
+            jid=s.new_job([name for name,_ in items])
             s.executor.submit(s.run,jid,items,llm)
             return self.send({'job_id':jid},202)
         m=re.fullmatch(r'/api/documents/([0-9a-f]{32})/review',p)
@@ -222,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
             llm=bool(data.get('use_llm'))
             if llm and not public_config()['llm_ready']:raise ValueError('请先配置大模型')
             if any(j['status']=='running' for j in s.jobs.values()):raise ValueError('请等待当前任务结束后重试')
-            jid=uuid.uuid4().hex;s.jobs[jid]={'id':jid,'status':'running','total':1,'done':0,'results':[],'errors':[]}
+            jid=s.new_job([s.get(i)['filename']])
             s.executor.submit(s.reprocess,jid,i,llm)
             return self.send({'job_id':jid},202)
         self.send({'error':'未找到'},404)

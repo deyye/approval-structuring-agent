@@ -1,5 +1,6 @@
 """Evidence-first extraction: local rules, optional grounded LLM, no sample answers."""
 from __future__ import annotations
+from .progress import report
 from .model_client import chat, ModelError
 from . import vision_ocr
 import base64, copy, io, json, os, re, shutil, tempfile, urllib.request
@@ -62,6 +63,7 @@ def parse_pdf(path):
         if doc.needs_pass: raise ValueError('PDF已加密，请先解除密码保护。')
         if len(doc)>100: raise ValueError('单份文件最多100页，请拆分后上传。')
         for pi, p in enumerate(doc):
+            report("读取页面", f"第 {pi+1} / {len(doc)} 页")
             # Remove rotation for a consistent evidence/render coordinate system.
             if p.rotation: p.set_rotation(0)
             if p.rect.width>2500 or p.rect.height>2500:raise ValueError('页面尺寸过大，请缩小PDF页面后重试。')
@@ -71,6 +73,7 @@ def parse_pdf(path):
             ocr_fallback, blank = [], False
             native_text = clean(p.get_text())
             if len(native_text)<30:
+                report("识别扫描文字", f"第 {pi+1} / {len(doc)} 页，OCR 处理中")
                 try:
                     import shutil,subprocess
                     executable=shutil.which('tesseract')
@@ -294,6 +297,7 @@ METRICS=[
 
 def extract(path,name,doc_id,use_llm=False):
     pages,lines,text,offsets,warnings=parse_pdf(path)
+    report("提取字段", "提取 14 项信息、建设指标与原文坐标")
     fs={k:empty() for k in FIELDS}
     for a,b,l in offsets:
         if l['page']==1 and re.fullmatch(DOC_NUMBER_RE,l['text']):
@@ -432,6 +436,7 @@ def extract(path,name,doc_id,use_llm=False):
         for c in fs.values():
             if c['value'] is None:c['status']='uncertain'
     if use_llm:
+        report("模型辅助", "等待文字模型返回；失败时保留本地结果")
         try:
             candidate=copy.deepcopy(result)
             augment_llm(candidate)
@@ -439,6 +444,7 @@ def extract(path,name,doc_id,use_llm=False):
         except Exception as exc:
             result['warnings'].append('大模型抽取失败，已保留本地结果：'+(str(exc) if isinstance(exc,ModelError) else type(exc).__name__))
     if use_llm and os.getenv('VISION_MODEL'):
+        report('视觉确认', '核对印章候选图像')
         try:verify_seal(result,path)
         except Exception as exc:result['warnings'].append('印章视觉确认失败：'+(str(exc) if isinstance(exc,ModelError) else type(exc).__name__))
     # 空字段要给出原因：原文确无该要素，还是原文有线索却没抽到。
