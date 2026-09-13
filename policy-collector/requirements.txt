@@ -1,3 +1,0 @@
-# 采集与抽取全部基于 Python 标准库（urllib / html.parser / sqlite3 / re），
-# 仅 Excel 导出需要 openpyxl。
-openpyxl>=3.1
