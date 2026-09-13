@@ -4,7 +4,13 @@ import unittest
 from unittest.mock import patch
 from app.server import Store
 from app.progress import report
-from test_v2 import document
+# 两种运行方式都要能用：`unittest discover -s tests` 时 tests/ 在 sys.path 上，
+# 而 `-m unittest tests.test_progress` 时需要走包路径，否则单独跑这个文件会
+# ModuleNotFoundError，看起来像测试坏了。
+try:
+    from tests.test_v2 import document
+except ImportError:
+    from test_v2 import document
 
 class ProgressTests(unittest.TestCase):
     def test_files_report_actual_steps_and_duplicate_once(self):

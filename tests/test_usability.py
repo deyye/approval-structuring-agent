@@ -5,7 +5,13 @@ from app.server import Handler,Store
 from app.queue import project_progress
 from app.compare import rows_for
 from app.review import update
-from test_v2 import document,cell
+# 两种运行方式都要能用：`discover -s tests` 时 tests/ 在 sys.path 上，
+# 而 `-m unittest tests.test_usability` 需要走包路径，否则单独跑这个文件
+# 会 ModuleNotFoundError，看起来像测试坏了。
+try:
+    from tests.test_v2 import document,cell
+except ImportError:
+    from test_v2 import document,cell
 
 class UsabilityTests(unittest.TestCase):
     def test_confirmation_does_not_clear_other_conflicts(self):
