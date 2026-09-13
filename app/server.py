@@ -58,7 +58,7 @@ class Store:
             self.persist_jobs()
     def persist_jobs(self):
         with self.lock:
-            self.job_path.parent.mkdir(exist_ok=True)
+            self.job_path.parent.mkdir(parents=True,exist_ok=True)
             temp=self.job_path.with_suffix('.tmp')
             temp.write_text(json.dumps(self.jobs,ensure_ascii=False),encoding='utf-8')
             temp.replace(self.job_path)
