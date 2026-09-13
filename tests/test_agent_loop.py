@@ -15,7 +15,7 @@ import fitz
 
 from app import agent_loop as A
 from app.extract import extract, mark_conflicts
-from app.model_client import ModelError
+from app.model_client import ModelError, set_config_path
 
 # 主干模式要求「≥2 字 + 度量后缀 + 数值」，因此「工作内容名 + 数值 + 单位」抽不到；
 # 这正是那 4 份公开批文指标为空的形态（滨海植被修复22.85hm2）。
@@ -176,6 +176,11 @@ class AgentLoopTests(unittest.TestCase):
 
 class PlannerIsolationTests(unittest.TestCase):
     """循环与大脑解耦：没有模型密钥时，规则规划器仍可工作。"""
+
+    def setUp(self):
+        # 关掉配置文件：这组测试验证「没有可用配置」时的行为，
+        # 不能因为本机界面上配过模型就跟着漂移。
+        set_config_path(None);self.addCleanup(set_config_path,None)
 
     def test_llm_planner_refuses_without_configuration(self):
         with patch.dict(os.environ, {}, clear=True):

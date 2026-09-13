@@ -6,7 +6,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
-from app.model_client import chat, probe, public_config, settings, ModelError
+from app.model_client import chat, probe, public_config, settings, set_config_path, ModelError
 
 class WireHandler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
@@ -25,6 +25,9 @@ def completion(content='{"ok":true}',finish='stop'):
 
 class ModelClientTests(unittest.TestCase):
     def setUp(self):
+        # 禁用配置文件：否则默认路径下的 data/model_config.json 一旦被界面上保存过，
+        # 「未配置时 llm_ready 为假」这类断言就会跟着环境漂移。
+        set_config_path(None);self.addCleanup(set_config_path,None)
         self.server=ThreadingHTTPServer(('127.0.0.1',0),WireHandler)
         self.server.calls=[];self.server.replies=[]
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()

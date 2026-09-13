@@ -20,12 +20,14 @@ EDITABLE = ('LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'VISION_MODEL', 'LLM_TIM
             'LLM_HTTP_HOSTS', 'LLM_ALLOW_NO_KEY')
 DEFAULTS = {'LLM_TIMEOUT_SECONDS': '90', 'LLM_MAX_RETRIES': '2', 'LLM_MAX_TOKENS': '8192',
             'LLM_JSON_MODE': 'true', 'LLM_EXTRA_BODY': '{}', 'LLM_ALLOW_NO_KEY': 'false'}
-_CONFIG_PATH = None
+# 默认指向仓库 data/：命令行脚本（scripts/check_model.py 等）不走服务启动流程，
+# 也必须能读到界面上保存的配置，否则会出现「界面配好了、脚本却说没配」。
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / 'data' / 'model_config.json'
 _CACHE = {'mtime': None, 'data': {}}
 
 
 def set_config_path(path):
-    """服务启动时指向实际 DATA_DIR；传 None 表示只认环境变量（独立脚本与测试用）。"""
+    """服务启动时指向实际 DATA_DIR；传 None 表示禁用配置文件（测试隔离用）。"""
     global _CONFIG_PATH
     _CONFIG_PATH = Path(path) if path is not None else None
     _CACHE.update(mtime=None, data={})
