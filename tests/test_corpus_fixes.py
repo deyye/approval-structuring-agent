@@ -200,7 +200,7 @@ class HeaderOcrTests(unittest.TestCase):
     def _run(self, name='doc.pdf', ocr=None, ocr_returns=None):
         with tempfile.TemporaryDirectory() as td:
             p = _pdf(td, ['瑞安市安阳街道办事处：', *BODY], name=name, header_image=True)
-            with patch('app.extract.vision_ocr.recognize', return_value=ocr_returns):
+            with patch('app.extract.vision_ocr.recognize', return_value=ocr_returns), patch('app.extract.vision_ocr.available', return_value=True), patch.object(fitz.Page, 'get_textpage_ocr', side_effect=RuntimeError('exercise fallback')):
                 return extract(p, p.name, '0' * 32, False)
 
     def test_ocr_recovers_header_mark_text(self):
@@ -334,7 +334,7 @@ class HeaderMarkValidationTests(unittest.TestCase):
         path = Path(td) / 'doc.pdf'
         doc.save(path)
         ocr = '浙江政务服务网\n%s\n关于瑞安市安阳街道广场社区管网改造工程初步设计的批复\n' % merged
-        with patch('app.extract.vision_ocr.recognize', return_value=(ocr, 'macos-vision')):
+        with patch('app.extract.vision_ocr.recognize', return_value=(ocr, 'macos-vision')), patch('app.extract.vision_ocr.available', return_value=True), patch.object(fitz.Page, 'get_textpage_ocr', side_effect=RuntimeError('exercise fallback')):
             return extract(path, 'doc.pdf', '0' * 32, False)
 
     def test_first_line_of_defence_strips_known_watermark(self):
@@ -378,7 +378,7 @@ class WholePageOcrFallbackTests(unittest.TestCase):
     def test_blank_page_marked_blank_without_alarm(self):
         with tempfile.TemporaryDirectory() as td:
             path = self._blank(td)
-            with patch('app.extract.vision_ocr.recognize', return_value=(None, None)):
+            with patch('app.extract.vision_ocr.recognize', return_value=(None, None)), patch('app.extract.vision_ocr.available', return_value=True), patch.object(fitz.Page, 'get_textpage_ocr', side_effect=RuntimeError('exercise fallback')):
                 pages, lines, text, offsets, warnings = parse_pdf(path)
         self.assertEqual(pages[0]['text_state'], 'blank')
         self.assertFalse(any('需复核' in w for w in warnings))
@@ -386,7 +386,7 @@ class WholePageOcrFallbackTests(unittest.TestCase):
     def test_inked_page_without_text_still_flagged(self):
         with tempfile.TemporaryDirectory() as td:
             path = self._inked(td)
-            with patch('app.extract.vision_ocr.recognize', return_value=(None, None)):
+            with patch('app.extract.vision_ocr.recognize', return_value=(None, None)), patch('app.extract.vision_ocr.available', return_value=True), patch.object(fitz.Page, 'get_textpage_ocr', side_effect=RuntimeError('exercise fallback')):
                 pages, lines, text, offsets, warnings = parse_pdf(path)
         self.assertEqual(pages[0]['text_state'], 'unreadable')
         self.assertTrue(any('需复核' in w for w in warnings))
@@ -397,7 +397,7 @@ class WholePageOcrFallbackTests(unittest.TestCase):
         scanned = ('浙江政务服务网\n瑞安市发展和改革局\n项目总投资2998万元\n项目建设工期为24个月\n')
         with tempfile.TemporaryDirectory() as td:
             path = self._inked(td)
-            with patch('app.extract.vision_ocr.recognize', return_value=(scanned, 'macos-vision')):
+            with patch('app.extract.vision_ocr.recognize', return_value=(scanned, 'macos-vision')), patch('app.extract.vision_ocr.available', return_value=True), patch.object(fitz.Page, 'get_textpage_ocr', side_effect=RuntimeError('exercise fallback')):
                 pages, lines, text, offsets, warnings = parse_pdf(path)
         self.assertEqual(pages[0]['text_method'], 'ocr-vision')
         self.assertEqual(pages[0]['text_state'], 'readable')
@@ -416,7 +416,7 @@ class WholePageOcrFallbackTests(unittest.TestCase):
         # 空白页属"确实没有内容"，不应把整份文档的空字段降级为 uncertain。
         with tempfile.TemporaryDirectory() as td:
             path = self._blank(td)
-            with patch('app.extract.vision_ocr.recognize', return_value=(None, None)):
+            with patch('app.extract.vision_ocr.recognize', return_value=(None, None)), patch('app.extract.vision_ocr.available', return_value=True), patch.object(fitz.Page, 'get_textpage_ocr', side_effect=RuntimeError('exercise fallback')):
                 r = extract(path, path.name, '0' * 32, False)
         self.assertEqual(r['fields']['总投资/匡算/估算/概算']['status'], 'missing')
 
